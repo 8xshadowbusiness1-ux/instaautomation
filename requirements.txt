@@ -1,0 +1,5 @@
+python-telegram-bot==13.15
+instagrapi==1.17.3
+requests==2.31.0
+schedule==1.2.0
+urllib3==2.2.2
