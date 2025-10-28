@@ -1,19 +1,14 @@
 """
-instaautomation.py - Final single-file Instagram Scheduler Bot (Telegram controlled)
+instaautomation.py - Webhook + Full Commands (Render optimized)
 
-FEATURES:
-- Telegram bot commands for full video queue management, priority, scheduling, captions.
-- Interactive /schedule flow: (video -> caption -> time). Scheduled posts tagged shd1, shd2...
-- Weighted random posting for queue (priority weight multiplier).
-- /status dashboard with Mode, Next Post, Total Videos, Priority count, Interval, Caption, Scheduled list, Last post.
-- /viewallcmd shows all commands with short descriptions.
-- Keep-alive: Flask endpoint + self-ping thread to prevent Render free from sleeping.
-- Uses instagrapi (private API) for posting — NOT official Graph API.
-- Data saved in data.json. Videos saved to videos/ (ephemeral on free hosts).
-- IMPORTANT: Replace placeholders for BOT_TOKEN and Instagram credentials locally. Do NOT commit them publicly.
-
-DEPENDENCIES:
-pip install python-telegram-bot==13.15 instagrapi==1.17.3 requests schedule flask
+Features:
+- Full command set (addvideo, addpriority, list, show, remove, removepriority, setcaption,
+  viewcaption, removecaption, settimer, startposting, stopposting, schedule, listscheduled,
+  removescheduled, status, viewallcmd, help, start, login).
+- Webhook mode for Telegram (Flask route) — no polling, no getUpdates conflict.
+- Background worker for scheduled & queue posting preserved.
+- Safe: loads secrets from environment (do NOT hardcode).
+- Keep-alive self-ping thread (set MY_RENDER_URL).
 """
 
 import os
@@ -24,34 +19,28 @@ import random
 from datetime import datetime, timedelta
 from functools import wraps
 
-# Third-party libs
 from instagrapi import Client
-from flask import Flask
+from flask import Flask, request
 import requests
-from telegram import Update
-from telegram.ext import (Updater, CommandHandler, MessageHandler, Filters,
-                          ConversationHandler, CallbackContext)
+from telegram import Bot, Update
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, ConversationHandler, CallbackContext
 
 # -----------------------------
-# CONFIG - REPLACE LOCALLY (DO NOT COMMIT)
+# CONFIG - via ENVIRONMENT (safe)
 # -----------------------------
-BOT_TOKEN = "8466892151:AAGYohZaOn0WrJCh-Ou-Wr6i92pD6kMFMS0"
-INSTAGRAM_USERNAME = "courseprovider.in"
-INSTAGRAM_PASSWORD = "nishakumari"
-
-# Optional: set to your Telegram user id to restrict usage. None = open to anyone who can contact the bot.
-ADMIN_CHAT_ID = None
-
-# Render URL for self-ping (set after deploy), e.g. https://myapp.onrender.com
-MY_RENDER_URL = "https://YOUR-RENDER-APP-NAME.onrender.com"
+BOT_TOKEN = os.getenv("8466892151:AAGYohZaOn0WrJCh-Ou-Wr6i92pD6kMFMS0", "")
+INSTAGRAM_USERNAME = os.getenv("courseprovider.in", "")
+INSTAGRAM_PASSWORD = os.getenv("nishakumari", "")
+ADMIN_CHAT_ID = int(os.getenv("1602198875")) if os.getenv("ADMIN_CHAT_ID") else None
+MY_RENDER_URL = os.getenv("MY_RENDER_URL", "").rstrip("/")
 
 DATA_FILE = "data.json"
 VIDEO_DIR = "videos"
-START_PORT = 10000  # Flask port (Render may route externally)
+START_PORT = int(os.getenv("PORT", 10000))
 
-# Posting behavior
-PRIORITY_WEIGHT = 3
-INSTAPOST_SLEEP_AFTER_FAIL = 30  # seconds to wait after a failed IG post attempt
+# posting behavior
+PRIORITY_WEIGHT = int(os.getenv("PRIORITY_WEIGHT", 3))
+INSTAPOST_SLEEP_AFTER_FAIL = int(os.getenv("INSTAPOST_SLEEP_AFTER_FAIL", 30))
 
 # -----------------------------
 # Ensure directories
@@ -79,13 +68,12 @@ def load_data():
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w") as f:
             json.dump(DEFAULT_DATA, f, indent=2)
-        return DEFAULT_DATA.copy()
+        return json.loads(json.dumps(DEFAULT_DATA))
     with open(DATA_FILE, "r") as f:
         try:
             d = json.load(f)
         except Exception:
-            d = DEFAULT_DATA.copy()
-    # ensure keys
+            d = json.loads(json.dumps(DEFAULT_DATA))
     for k, v in DEFAULT_DATA.items():
         if k not in d:
             d[k] = v
@@ -107,16 +95,20 @@ ig_client = None
 ig_lock = threading.Lock()
 
 
-def ig_login():
+def ig_login(force=False):
     global ig_client
     with ig_lock:
-        if ig_client is None:
+        if ig_client is None or force:
             ig_client = Client()
             try:
+                if not INSTAGRAM_USERNAME or not INSTAGRAM_PASSWORD:
+                    print("Instagram credentials not set in environment.")
+                    ig_client = None
+                    return None
                 ig_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-                print("Instagram: logged in.")
+                print("✅ Instagram: logged in.")
             except Exception as e:
-                print("Instagram login error:", e)
+                print("⚠️ Instagram login error:", e)
                 ig_client = None
         return ig_client
 
@@ -181,11 +173,13 @@ def parse_datetime(text):
 
 
 # -----------------------------
-# Telegram handlers & conversation states
+# Conversation states
 # -----------------------------
 ASK_SCHED_VIDEO, ASK_SCHED_CAPTION, ASK_SCHED_TIME = range(3)
 
-
+# -----------------------------
+# Telegram handlers
+# -----------------------------
 def start_cmd(update: Update, context: CallbackContext):
     update.message.reply_text("🚀 InstaAutomation Bot ready. Use /viewallcmd to see commands.")
 
@@ -194,7 +188,7 @@ def help_cmd(update: Update, context: CallbackContext):
     update.message.reply_text("Use /viewallcmd to see all commands.")
 
 
-# Video add
+# Add Video flows
 @admin_only
 def addvideo_start(update: Update, context: CallbackContext):
     update.message.reply_text("📥 Please send the video file you want to add to queue (normal).")
@@ -220,7 +214,7 @@ def receive_video_for_add(update: Update, context: CallbackContext):
     path = os.path.join(VIDEO_DIR, f"{new_code}.mp4")
     try:
         file = context.bot.get_file(file_id)
-        file.download(path)
+        file.download(custom_path=path)
     except Exception as e:
         update.message.reply_text(f"❌ Failed to download video: {e}")
         context.user_data.pop('add_type', None)
@@ -384,7 +378,7 @@ def schedule_receive_video(update: Update, context: CallbackContext):
     path = os.path.join(VIDEO_DIR, f"{shd_tmp_code}.mp4")
     try:
         file = context.bot.get_file(file_id)
-        file.download(path)
+        file.download(custom_path=path)
     except Exception as e:
         update.message.reply_text(f"❌ Failed to download video: {e}")
         return ConversationHandler.END
@@ -517,10 +511,13 @@ def status_cmd(update: Update, context: CallbackContext):
         dt = datetime.fromisoformat(next_scheduled["datetime"])
         cand = f"Scheduled {next_scheduled['shd_code']} at {dt.strftime('%Y-%m-%d %H:%M')}"
         if next_queue_delta is not None:
-            next_queue_abs = datetime.fromisoformat(next_queue_iso)
-            if next_queue_abs <= dt:
-                lines.append(f"• Next Post: {next_post_text}")
-            else:
+            try:
+                next_queue_abs = datetime.fromisoformat(next_queue_iso)
+                if next_queue_abs <= dt:
+                    lines.append(f"• Next Post: {next_post_text}")
+                else:
+                    lines.append(f"• Next Post: {cand}")
+            except:
                 lines.append(f"• Next Post: {cand}")
         else:
             lines.append(f"• Next Post: {cand}")
@@ -691,14 +688,74 @@ def viewallcmd_cmd(update: Update, context: CallbackContext):
 
 
 # -----------------------------
-# Flask keep-alive server & self-ping
+# Flask + Telegram webhook setup
 # -----------------------------
 app = Flask(__name__)
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN not set in environment. Exiting.")
+    raise SystemExit("BOT_TOKEN not set")
 
+bot = Bot(BOT_TOKEN)
+dispatcher = Dispatcher(bot, None, use_context=True)
 
-@app.route('/')
+# Register handlers to dispatcher
+dispatcher.add_handler(CommandHandler("start", start_cmd))
+dispatcher.add_handler(CommandHandler("help", help_cmd))
+dispatcher.add_handler(CommandHandler("viewallcmd", viewallcmd_cmd))
+
+# Add video flows
+dispatcher.add_handler(CommandHandler("addvideo", addvideo_start))
+dispatcher.add_handler(CommandHandler("addpriority", addpriority_start))
+dispatcher.add_handler(MessageHandler(Filters.video | Filters.document, receive_video_for_add), group=1)
+
+# Video management
+dispatcher.add_handler(CommandHandler("list", list_cmd))
+dispatcher.add_handler(CommandHandler("show", show_cmd))
+dispatcher.add_handler(CommandHandler("remove", remove_cmd))
+dispatcher.add_handler(CommandHandler("removepriority", removepriority_cmd))
+
+# Caption
+dispatcher.add_handler(CommandHandler("setcaption", setcaption_cmd))
+dispatcher.add_handler(CommandHandler("viewcaption", viewcaption_cmd))
+dispatcher.add_handler(CommandHandler("removecaption", removecaption_cmd))
+
+# Timer & posting
+dispatcher.add_handler(CommandHandler("settimer", settimer_cmd))
+dispatcher.add_handler(CommandHandler("startposting", startposting_cmd))
+dispatcher.add_handler(CommandHandler("stopposting", stopposting_cmd))
+
+# Schedule conversation
+conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('schedule', schedule_start)],
+    states={
+        ASK_SCHED_VIDEO: [MessageHandler(Filters.video | Filters.document, schedule_receive_video)],
+        ASK_SCHED_CAPTION: [MessageHandler(Filters.text & ~Filters.command, schedule_receive_caption),
+                            MessageHandler(Filters.command, schedule_receive_caption)],
+        ASK_SCHED_TIME: [MessageHandler(Filters.text & ~Filters.command, schedule_receive_time)]
+    },
+    fallbacks=[],
+    allow_reentry=True
+)
+dispatcher.add_handler(conv_handler)
+
+dispatcher.add_handler(CommandHandler("listscheduled", listscheduled_cmd))
+dispatcher.add_handler(CommandHandler("removescheduled", removescheduled_cmd))
+dispatcher.add_handler(CommandHandler("status", status_cmd))
+
+# Basic webhook route
+@app.route("/", methods=["GET"])
 def home():
     return "Bot is alive!", 200
+
+
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    try:
+        update = Update.de_json(request.get_json(force=True), bot)
+        dispatcher.process_update(update)
+    except Exception as e:
+        print("Webhook processing error:", e)
+    return "ok", 200
 
 
 def keep_alive_ping(url):
@@ -708,93 +765,38 @@ def keep_alive_ping(url):
             print(f"🔁 Self ping sent to {url}")
         except Exception as e:
             print(f"Ping failed: {e}")
-        time.sleep(3600)  # every 1 hour
+        time.sleep(3600)
 
 
 # -----------------------------
-# Main startup & dispatcher
+# /login command (Instagram)
 # -----------------------------
-def main():
-    if BOT_TOKEN.startswith("YOUR_"):
-        print("ERROR: Set BOT_TOKEN in the script (or via environment variable). Exiting.")
-        return
+def login_cmd(update: Update, context: CallbackContext):
+    update.message.reply_text("🔐 Trying to log in to Instagram...")
+    cl = ig_login(force=True)
+    if cl:
+        update.message.reply_text(f"✅ Logged in as {INSTAGRAM_USERNAME}")
+    else:
+        update.message.reply_text("⚠️ Login failed. Check IG credentials or challenge/2FA.")
 
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
 
-    # Basic commands
-    dp.add_handler(CommandHandler("start", start_cmd))
-    dp.add_handler(CommandHandler("help", help_cmd))
-    dp.add_handler(CommandHandler("viewallcmd", viewallcmd_cmd))
-
-    # Add video flows
-    dp.add_handler(CommandHandler("addvideo", addvideo_start))
-    dp.add_handler(CommandHandler("addpriority", addpriority_start))
-    dp.add_handler(MessageHandler(Filters.video | Filters.document, receive_video_for_add))
-
-    # Video management
-    dp.add_handler(CommandHandler("list", list_cmd))
-    dp.add_handler(CommandHandler("show", show_cmd, pass_args=True))
-    dp.add_handler(CommandHandler("remove", remove_cmd, pass_args=True))
-    dp.add_handler(CommandHandler("removepriority", removepriority_cmd, pass_args=True))
-
-    # Caption
-    dp.add_handler(CommandHandler("setcaption", setcaption_cmd, pass_args=True))
-    dp.add_handler(CommandHandler("viewcaption", viewcaption_cmd))
-    dp.add_handler(CommandHandler("removecaption", removecaption_cmd))
-
-    # Timer & posting
-    dp.add_handler(CommandHandler("settimer", settimer_cmd, pass_args=True))
-    dp.add_handler(CommandHandler("startposting", startposting_cmd))
-    dp.add_handler(CommandHandler("stopposting", stopposting_cmd))
-
-    # Schedule conversation handler
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('schedule', schedule_start)],
-        states={
-            ASK_SCHED_VIDEO: [MessageHandler(Filters.video | Filters.document, schedule_receive_video)],
-            ASK_SCHED_CAPTION: [MessageHandler(Filters.text & ~Filters.command, schedule_receive_caption),
-                                MessageHandler(Filters.command, schedule_receive_caption)],
-            ASK_SCHED_TIME: [MessageHandler(Filters.text & ~Filters.command, schedule_receive_time)]
-        },
-        fallbacks=[],
-        allow_reentry=True
-    )
-    dp.add_handler(conv_handler)
-
-    dp.add_handler(CommandHandler("listscheduled", listscheduled_cmd))
-    dp.add_handler(CommandHandler("removescheduled", removescheduled_cmd, pass_args=True))
-
-    dp.add_handler(CommandHandler("status", status_cmd))
-
-    # start background worker thread
-    t = threading.Thread(target=background_worker, daemon=True)
-    t.start()
-
-    # start polling
-    updater.start_polling()
-    print("Bot started (Telegram polling).")
-    updater.idle()
+dispatcher.add_handler(CommandHandler("login", login_cmd))
 
 
 # -----------------------------
-# Run Flask + self-ping + main
+# Start background worker & Flask
 # -----------------------------
-def run_flask():
-    # Use START_PORT; Render will route externally via provided URL
-    app.run(host="0.0.0.0", port=START_PORT)
-
-
 if __name__ == "__main__":
-    # Start Flask in background
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    # Start background worker
+    worker_thread = threading.Thread(target=background_worker, daemon=True)
+    worker_thread.start()
 
-    # Start self-ping thread if MY_RENDER_URL configured
-    if MY_RENDER_URL and not MY_RENDER_URL.startswith("https://YOUR-RENDER-APP-NAME"):
+    # Start self-ping if MY_RENDER_URL set
+    if MY_RENDER_URL and "YOUR-RENDER" not in MY_RENDER_URL:
         ping_thread = threading.Thread(target=keep_alive_ping, args=(MY_RENDER_URL,), daemon=True)
         ping_thread.start()
     else:
         print("Warning: MY_RENDER_URL not set or placeholder. Set it to your deployed app URL to enable self-ping (keep-alive).")
 
-    main()
+    print("🚀 Starting Flask webhook server...")
+    app.run(host="0.0.0.0", port=START_PORT)
