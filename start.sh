@@ -5,7 +5,7 @@ pip install -r requirements.txt
 # Run the bot (auto restart if it crashes)
 while true; do
   echo "🚀 Starting bot at $(date)"
-  python3 bot.py
+  python3 instaautomation.py
   echo "⚠️ Bot crashed — restarting in 10 seconds..."
   sleep 10
 done
