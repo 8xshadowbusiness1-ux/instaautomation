@@ -28,10 +28,10 @@ from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, Co
 # -----------------------------
 # CONFIG - via ENVIRONMENT (safe)
 # -----------------------------
-BOT_TOKEN = os.getenv("8466892151:AAGYohZaOn0WrJCh-Ou-Wr6i92pD6kMFMS0", "")
-INSTAGRAM_USERNAME = os.getenv("courseprovider.in", "")
-INSTAGRAM_PASSWORD = os.getenv("nishakumari", "")
-ADMIN_CHAT_ID = int(os.getenv("1602198875")) if os.getenv("ADMIN_CHAT_ID") else None
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID")) if os.getenv("ADMIN_CHAT_ID") else None
 MY_RENDER_URL = os.getenv("MY_RENDER_URL", "").rstrip("/")
 
 DATA_FILE = "data.json"
