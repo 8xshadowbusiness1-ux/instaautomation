@@ -34,11 +34,11 @@ from telegram.ext import (Updater, CommandHandler, MessageHandler, Filters,
 # -----------------------------
 # CONFIG - fill these
 # -----------------------------
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-INSTAGRAM_USERNAME = "YOUR_IG_USERNAME"
-INSTAGRAM_PASSWORD = "YOUR_IG_PASSWORD"
+BOT_TOKEN = "8466892151:AAGYohZaOn0WrJCh-Ou-Wr6i92pD6kMFMS0"
+INSTAGRAM_USERNAME = "courseprovider.in"
+INSTAGRAM_PASSWORD = "nishakumari"
 # Optional: restrict commands to a single Telegram user id (int). Set to None to allow anyone.
-ADMIN_CHAT_ID = None
+ADMIN_CHAT_ID = 1602198875
 
 DATA_FILE = "data.json"
 VIDEO_DIR = "videos"
@@ -740,3 +740,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
