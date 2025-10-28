@@ -787,6 +787,11 @@ dispatcher.add_handler(CommandHandler("login", login_cmd))
 # Start background worker & Flask
 # -----------------------------
 if __name__ == "__main__":
+    # Start Telegram Bot
+    print("🤖 Starting Telegram bot...")
+    updater.start_polling()
+    print("✅ Bot started (Telegram polling)")
+
     # Start background worker
     worker_thread = threading.Thread(target=background_worker, daemon=True)
     worker_thread.start()
@@ -796,7 +801,8 @@ if __name__ == "__main__":
         ping_thread = threading.Thread(target=keep_alive_ping, args=(MY_RENDER_URL,), daemon=True)
         ping_thread.start()
     else:
-        print("Warning: MY_RENDER_URL not set or placeholder. Set it to your deployed app URL to enable self-ping (keep-alive).")
+        print("⚠️ Warning: MY_RENDER_URL not set or placeholder. Set it to your deployed app URL to enable keep-alive.")
 
+    # Start Flask Server (keep-alive)
     print("🚀 Starting Flask webhook server...")
     app.run(host="0.0.0.0", port=START_PORT)
