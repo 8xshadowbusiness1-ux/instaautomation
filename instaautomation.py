@@ -297,6 +297,21 @@ def background_worker():
             print("Worker error:", e)
             time.sleep(5)
 
+# -----------------------------
+# Ensure correct webhook (auto-fix)
+# -----------------------------
+webhook_url = f"{MY_RENDER_URL}/{BOT_TOKEN}"
+
+try:
+    current_info = bot.get_webhook_info()
+    if not current_info or current_info.url != webhook_url:
+        print(f"⚙️ Resetting webhook to: {webhook_url}")
+        bot.delete_webhook()
+        bot.set_webhook(url=webhook_url)
+    else:
+        print(f"✅ Webhook already correct: {webhook_url}")
+except Exception as e:
+    print("⚠️ Webhook setup failed:", e)
 
 # -----------------------------
 # Flask Webhook
@@ -376,3 +391,4 @@ if __name__ == "__main__":
 
     print("🚀 Starting Flask server...")
     app.run(host="0.0.0.0", port=START_PORT)
+
