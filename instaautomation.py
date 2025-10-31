@@ -1,197 +1,132 @@
 import os
-import threading
-import requests
-import time
-import schedule
-import subprocess
+import logging
 from flask import Flask, request
 from instagrapi import Client
 from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
+from telegram.ext import Dispatcher, MessageHandler, Filters
+import threading
+import ffmpeg
 
-# -----------------------------
-# Environment Variables
-# -----------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
-INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-MY_RENDER_URL = os.getenv("MY_RENDER_URL", "").rstrip("/")
-START_PORT = int(os.getenv("PORT", "10000"))
+# ========== CONFIGURATION ==========
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+INSTAGRAM_USERNAME = "YOUR_INSTAGRAM_USERNAME"
+INSTAGRAM_PASSWORD = "YOUR_INSTAGRAM_PASSWORD"
 
-# -----------------------------
-# Directories (Render Safe)
-# -----------------------------
-try:
-    VIDEO_DIR = "/opt/render/project/src/videos"
-    os.makedirs(VIDEO_DIR, exist_ok=True)
-    print("📂 Video folder ready:", VIDEO_DIR)
-except Exception as e:
-    print("⚠️ Using fallback /tmp/videos:", e)
-    VIDEO_DIR = "/tmp/videos"
-    os.makedirs(VIDEO_DIR, exist_ok=True)
+# Render-compatible storage directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VIDEO_DIR = os.path.join(BASE_DIR, "videos")
+os.makedirs(VIDEO_DIR, exist_ok=True)
 
-# -----------------------------
-# Instagram Client Setup
-# -----------------------------
+app = Flask(__name__)
+
+# ========== LOGGING SETUP ==========
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ========== INSTAGRAM CLIENT SETUP ==========
 cl = Client()
 session_path = os.path.join(VIDEO_DIR, "ig_session.json")
 
 try:
     if os.path.exists(session_path):
         cl.load_settings(session_path)
-try:
-    cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-except Exception as e:
-    print("⚠️ Login challenge detected:", e)
-    try:
-        cl.challenge_resolve()
-        print("✅ Challenge automatically resolved (using saved session or trust)")
-    except Exception as inner:
-        print("❌ Challenge resolve failed — please verify on your Instagram app manually once.")
-
+        try:
+            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        except Exception as e:
+            print("⚠️ Login challenge detected:", e)
+            try:
+                cl.challenge_resolve()
+                print("✅ Challenge automatically resolved (using saved session or trust)")
+            except Exception as inner:
+                print("❌ Challenge resolve failed — please verify manually in your Instagram app.")
         print("✅ Loaded existing Instagram session")
     else:
-       try:
-    cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-except Exception as e:
-    print("⚠️ Login challenge detected:", e)
-    try:
-        cl.challenge_resolve()
-        print("✅ Challenge automatically resolved (using saved session or trust)")
-    except Exception as inner:
-        print("❌ Challenge resolve failed — please verify on your Instagram app manually once.")
-
+        try:
+            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        except Exception as e:
+            print("⚠️ Login challenge detected:", e)
+            try:
+                cl.challenge_resolve()
+                print("✅ Challenge automatically resolved (using saved session or trust)")
+            except Exception as inner:
+                print("❌ Challenge resolve failed — please verify manually in your Instagram app.")
         cl.dump_settings(session_path)
         print("✅ New Instagram session created")
 except Exception as e:
     print("❌ Instagram login failed:", e)
 
-# -----------------------------
-# Flask Server Setup
-# -----------------------------
-app = Flask(__name__)
+print(f"📂 Video folder ready: {VIDEO_DIR}")
 
-# -----------------------------
-# Telegram Bot Setup
-# -----------------------------
+# ========== TELEGRAM SETUP ==========
 bot = Bot(token=BOT_TOKEN)
-dispatcher = Dispatcher(bot, None, use_context=True)
+dispatcher = Dispatcher(bot, None, workers=4)
 
-# -----------------------------
-# FFmpeg Video Upload Function
-# -----------------------------
-def upload_video_to_instagram(video_path, caption=""):
+# ========== VIDEO HANDLER ==========
+def handle_video(update: Update, context):
     try:
-        if not os.path.exists(video_path):
-            print("❌ Video not found:", video_path)
-            return False
+        video = update.message.video or update.message.document
+        if not video:
+            update.message.reply_text("❌ No video found in your message.")
+            return
 
-        converted_path = os.path.join(VIDEO_DIR, f"converted_{os.path.basename(video_path)}")
-        print("🎬 Converting video for Instagram upload...")
-        subprocess.run([
-            "ffmpeg", "-i", video_path,
-            "-vf", "scale=720:-2",  # Resize to safe width
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            converted_path,
-            "-y"
-        ], check=True)
+        # Download video
+        file = bot.get_file(video.file_id)
+        video_path = os.path.join(VIDEO_DIR, f"{video.file_id}.mp4")
+        file.download(custom_path=video_path)
+        update.message.reply_text("🎥 Video received. Preparing for Instagram upload...")
 
-        print("🎥 Uploading converted video to Instagram:", converted_path)
-        cl.video_upload(converted_path, caption)
-        print("✅ Video posted successfully")
-        return True
-    except subprocess.CalledProcessError as e:
-        print("⚠️ Video conversion failed:", e)
-        return False
+        # Convert using FFmpeg (to ensure compatibility)
+        converted_path = os.path.join(VIDEO_DIR, f"converted_{video.file_id}.mp4")
+        (
+            ffmpeg
+            .input(video_path)
+            .output(converted_path, vcodec='libx264', acodec='aac', vf='scale=720:-1')
+            .overwrite_output()
+            .run(quiet=True)
+        )
+
+        update.message.reply_text("📤 Uploading to Instagram...")
+
+        # Upload to Instagram Feed
+        cl.clip_upload(
+            path=converted_path,
+            caption="🎬 Uploaded automatically via Telegram bot 🤖"
+        )
+
+        update.message.reply_text("✅ Successfully posted on Instagram!")
+        print(f"✅ Uploaded video: {converted_path}")
+
     except Exception as e:
-        print("⚠️ Video upload failed:", e)
-        return False
+        logger.error(f"Upload error: {e}")
+        update.message.reply_text(f"❌ Upload failed: {e}")
 
-# -----------------------------
-# Telegram Handlers
-# -----------------------------
-def start(update, context):
-    update.message.reply_text("👋 Bot is online! Send me a video to post on Instagram.")
+# Register handler
+dispatcher.add_handler(MessageHandler(Filters.video | Filters.document.video, handle_video))
 
-def handle_video(update, context):
-    try:
-        file = update.message.video.get_file()
-        caption = update.message.caption or ""
-        video_path = os.path.join(VIDEO_DIR, f"{file.file_id}.mp4")
-        file.download(video_path)
-        update.message.reply_text("📥 Video received! Uploading to Instagram...")
-        print(f"📥 Downloaded: {video_path}")
-
-        success = upload_video_to_instagram(video_path, caption)
-        if success:
-            update.message.reply_text("✅ Video uploaded to Instagram successfully!")
-        else:
-            update.message.reply_text("⚠️ Failed to upload video. Check logs.")
-    except Exception as e:
-        print("⚠️ Telegram video handler error:", e)
-        update.message.reply_text("❌ Something went wrong while uploading.")
-
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(MessageHandler(Filters.video, handle_video))
-
-# -----------------------------
-# Webhook Route
-# -----------------------------
+# ========== WEBHOOK SETUP ==========
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
-    return "ok"
+    return "OK", 200
 
-@app.route("/", methods=["GET"])
-def home():
-    return "Telegram-Instagram Bot is Live 🚀", 200
+@app.route("/", methods=["GET", "HEAD"])
+def index():
+    return "🤖 InstaAutomation Bot is Running!", 200
 
-# -----------------------------
-# Keep-Alive Ping
-# -----------------------------
-def keep_alive_ping():
+# ========== BACKGROUND THREAD ==========
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
+def keep_alive():
+    import time
     while True:
-        if MY_RENDER_URL:
-            try:
-                requests.head(MY_RENDER_URL)
-                print("🔁 Keep-alive ping sent.")
-            except Exception:
-                print("⚠️ Keep-alive ping failed.")
-        time.sleep(300)
+        time.sleep(60)
+        print("🔁 Keep-alive ping sent.")
 
-# -----------------------------
-# Background Scheduler
-# -----------------------------
-def background_worker():
-    while True:
-        schedule.run_pending()
-        time.sleep(10)
-
-# -----------------------------
-# MAIN
-# -----------------------------
+# ========== STARTUP ==========
 if __name__ == "__main__":
-    # Start background worker
-    threading.Thread(target=background_worker, daemon=True).start()
-
-    # Start keep-alive ping
-    if MY_RENDER_URL:
-        threading.Thread(target=keep_alive_ping, daemon=True).start()
-
-    # Set webhook
-    webhook_url = f"{MY_RENDER_URL}/{BOT_TOKEN}"
-    try:
-        bot.delete_webhook()
-        bot.set_webhook(url=webhook_url)
-        print(f"✅ Webhook OK: {webhook_url}")
-    except Exception as e:
-        print("⚠️ Failed to set webhook:", e)
-
-    print("🚀 Starting Telegram webhook bot...")
-    app.run(host="0.0.0.0", port=START_PORT)
-
-
+    print("🚀 Starting bot at", os.popen("date").read().strip())
+    print("✅ Webhook OK: Your Render URL will be set automatically.")
+    threading.Thread(target=run_flask).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
