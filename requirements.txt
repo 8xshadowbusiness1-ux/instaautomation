@@ -8,3 +8,4 @@ schedule==1.2.0
 urllib3==2.2.2
 flask==3.0.3
 Pillow==9.5.0
+moviepy==1.0.3
