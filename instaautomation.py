@@ -66,20 +66,15 @@ VIDEO_DIR = "/data/videos"
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
 # --------------------------
-# Instagram Upload Function
+# Directories (Render Safe)
 # --------------------------
-def upload_video_to_instagram(video_path, caption=""):
-    try:
-        if not os.path.exists(video_path):
-            print("❌ Video not found:", video_path)
-            return False
-        print("🎥 Uploading video to Instagram:", video_path)
-        cl.video_upload(video_path, caption)
-        print("✅ Video posted successfully")
-        return True
-    except Exception as e:
-        print("⚠️ Video upload failed:", e)
-        return False
+try:
+    VIDEO_DIR = "/opt/render/project/src/videos"
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+except Exception as e:
+    print("⚠️ Using fallback video folder:", e)
+    VIDEO_DIR = "/tmp/videos"
+    os.makedirs(VIDEO_DIR, exist_ok=True)
 
 # --------------------------
 # Telegram Commands
@@ -145,3 +140,4 @@ if __name__ == "__main__":
     threading.Thread(target=keep_alive_ping, args=(MY_RENDER_URL,), daemon=True).start()
     print("🚀 Starting Telegram webhook bot...")
     app.run(host="0.0.0.0", port=START_PORT)
+
