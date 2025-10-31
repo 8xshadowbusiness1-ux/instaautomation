@@ -62,8 +62,17 @@ ensure_webhook()
 # --------------------------
 # Directories
 # --------------------------
-VIDEO_DIR = "/data/videos"
-os.makedirs(VIDEO_DIR, exist_ok=True)
+# --------------------------
+# Directories (Render Safe)
+# --------------------------
+try:
+    VIDEO_DIR = "/opt/render/project/src/videos"
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+    print("📂 Video folder ready:", VIDEO_DIR)
+except Exception as e:
+    print("⚠️ Using fallback /tmp/videos:", e)
+    VIDEO_DIR = "/tmp/videos"
+    os.makedirs(VIDEO_DIR, exist_ok=True)
 
 # --------------------------
 # Directories (Render Safe)
@@ -140,4 +149,5 @@ if __name__ == "__main__":
     threading.Thread(target=keep_alive_ping, args=(MY_RENDER_URL,), daemon=True).start()
     print("🚀 Starting Telegram webhook bot...")
     app.run(host="0.0.0.0", port=START_PORT)
+
 
