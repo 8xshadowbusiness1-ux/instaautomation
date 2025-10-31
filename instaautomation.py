@@ -40,7 +40,7 @@ session_path = os.path.join(VIDEO_DIR, "ig_session.json")
 try:
     if os.path.exists(session_path):
         cl.load_settings(session_path)
-        try:
+try:
     cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
 except Exception as e:
     print("⚠️ Login challenge detected:", e)
@@ -193,4 +193,5 @@ if __name__ == "__main__":
 
     print("🚀 Starting Telegram webhook bot...")
     app.run(host="0.0.0.0", port=START_PORT)
+
 
