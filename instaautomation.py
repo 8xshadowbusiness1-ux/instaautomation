@@ -1,292 +1,324 @@
-#!/usr/bin/env python3
-"""
-Final instaautomation.py
-- Uses ffmpeg CLI via subprocess (no python-ffmpeg package)
-- Saves IG session to videos/ig_session.json
-- Webhook-based Telegram integration (Flask)
-- Video uploads via instagrapi.video_upload
-"""
-
 import os
-import sys
 import json
-import time
-import logging
 import threading
-import subprocess
-from datetime import datetime
+import time
+import random
+from datetime import datetime, timedelta
 from pathlib import Path
-
+from functools import wraps
 from flask import Flask, request
-from instagrapi import Client
-from telegram import Bot, Update
-from telegram.ext import Dispatcher, MessageHandler, Filters, CallbackContext
 
-# -----------------------
-# CONFIG (use env vars)
-# -----------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # set in Render
+from instagrapi import Client
+from telegram import Update, Bot
+from telegram.ext import (Dispatcher, CommandHandler, MessageHandler, Filters,
+                          ConversationHandler, CallbackContext)
+
+# -----------------------------
+# CONFIGURATION
+# -----------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID")) if os.getenv("ADMIN_CHAT_ID") else None
-PORT = int(os.getenv("PORT", 10000))
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0")) or None
 
-# -----------------------
-# Setup paths & folders
-# -----------------------
-BASE_DIR = Path(__file__).resolve().parent
-VIDEO_DIR = BASE_DIR / "videos"
-VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-SESSION_PATH = VIDEO_DIR / "ig_session.json"
+DATA_FILE = "data.json"
+VIDEO_DIR = "videos"
+os.makedirs(VIDEO_DIR, exist_ok=True)
 
-# -----------------------
-# Logging
-# -----------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("instaautomation")
+DEFAULT_DATA = {
+    "caption": "",
+    "interval_min": 1800,
+    "interval_max": 3600,
+    "videos": [],
+    "scheduled": [],
+    "last_post": {"video_code": None, "time": None},
+    "is_running": False,
+    "next_queue_post_time": None
+}
 
-# -----------------------
-# Check config early
-# -----------------------
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN not set. Exiting.")
-    sys.exit(1)
-if not INSTAGRAM_USERNAME or not INSTAGRAM_PASSWORD:
-    logger.warning("Instagram credentials not set. /login command will be available to try login later.")
-
-# -----------------------
-# Instagram client helper
-# -----------------------
-ig_lock = threading.Lock()
-ig_client = None
-
-
-def ig_login(force=False):
-    """
-    Return logged-in instagrapi.Client or None.
-    Saves/loads session to SESSION_PATH.
-    """
-    global ig_client
-    with ig_lock:
-        if ig_client is not None and not force:
-            return ig_client
-        cl = Client()
-        try:
-            # load settings if present
-            if SESSION_PATH.exists():
-                try:
-                    cl.load_settings(str(SESSION_PATH))
-                    logger.info("Loaded IG settings from session file.")
-                except Exception as e:
-                    logger.warning("Failed loading session file: %s", e)
-            # attempt login
-            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-            # dump settings (session) so next run is reused
-            cl.dump_settings(str(SESSION_PATH))
-            logger.info("✅ Instagram login successful and session saved.")
-            ig_client = cl
-            return ig_client
-        except Exception as e:
-            # challenge or other issues often require interactive input — notify admin
-            logger.exception("Instagram login failed: %s", e)
-            if ADMIN_CHAT_ID and BOT_TOKEN:
-                try:
-                    Bot(BOT_TOKEN).send_message(ADMIN_CHAT_ID,
-                        f"⚠️ Instagram login failed:\n{e}\nYou may need to verify login / solve challenge manually.")
-                except Exception:
-                    logger.exception("Failed to notify admin about IG login error.")
-            return None
-
-
-# -----------------------
-# ffmpeg conversion (uses ffmpeg binary)
-# -----------------------
-def ffmpeg_exists():
-    return shutil_which("ffmpeg") is not None
-
-
-def shutil_which(cmd):
-    # tiny wrapper to avoid importing shutil repeatedly
-    import shutil
-    return shutil.which(cmd)
-
-
-def convert_video_to_ig(src_path: str, dst_path: str) -> bool:
-    """
-    Convert input to IG-friendly MP4 using ffmpeg CLI.
-    Returns True on success, False otherwise.
-    """
-    ff = shutil_which("ffmpeg")
-    if not ff:
-        logger.warning("ffmpeg binary not found in PATH. Skipping conversion (may still work).")
-        # try copying as-is
-        try:
-            from shutil import copyfile
-            copyfile(src_path, dst_path)
-            return True
-        except Exception as e:
-            logger.exception("Failed copying video as fallback: %s", e)
-            return False
-
-    cmd = [
-        ff,
-        "-y",
-        "-i", src_path,
-        "-c:v", "libx264",
-        "-profile:v", "baseline",
-        "-level", "3.1",
-        "-pix_fmt", "yuv420p",
-        "-vf", "scale=720:-2",   # scale width to 720 keeping aspect ratio
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        dst_path
-    ]
-    try:
-        logger.info("Running ffmpeg: %s", " ".join(cmd))
-        # run and capture output for logs
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        if res.returncode != 0:
-            logger.error("ffmpeg failed: %s", res.stderr.decode(errors="ignore"))
-            return False
-        logger.info("ffmpeg conversion succeeded: %s", dst_path)
-        return True
-    except Exception as e:
-        logger.exception("ffmpeg conversion exception: %s", e)
-        return False
-
-
-# -----------------------
-# Telegram / Flask setup
-# -----------------------
+# -----------------------------
+# GLOBAL STATE
+# -----------------------------
+data_lock = threading.Lock()
 app = Flask(__name__)
 bot = Bot(BOT_TOKEN)
-dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
+dispatcher = Dispatcher(bot, None, workers=4)
 
+# -----------------------------
+# DATA HANDLING
+# -----------------------------
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "w") as f:
+            json.dump(DEFAULT_DATA, f, indent=2)
+        return DEFAULT_DATA.copy()
+    with open(DATA_FILE, "r") as f:
+        try:
+            d = json.load(f)
+        except Exception:
+            d = DEFAULT_DATA.copy()
+    for k, v in DEFAULT_DATA.items():
+        if k not in d:
+            d[k] = v
+    return d
 
-# -----------------------
-# Helper: send admin message
-# -----------------------
-def notify_admin(text: str):
-    if ADMIN_CHAT_ID is None:
-        return
+def save_data(d):
+    with data_lock:
+        with open(DATA_FILE, "w") as f:
+            json.dump(d, f, indent=2, default=str)
+
+data = load_data()
+
+# -----------------------------
+# INSTAGRAM LOGIN
+# -----------------------------
+ig_client = None
+ig_lock = threading.Lock()
+
+def ig_login():
+    global ig_client
+    with ig_lock:
+        if ig_client is None:
+            ig_client = Client()
+            session_path = os.path.join(VIDEO_DIR, "ig_session.json")
+            try:
+                if os.path.exists(session_path):
+                    ig_client.load_settings(session_path)
+                    ig_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+                    print("✅ Loaded IG session")
+                else:
+                    ig_client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+                    ig_client.dump_settings(session_path)
+                    print("✅ New IG login successful")
+            except Exception as e:
+                print("⚠️ IG Login Error:", e)
+                ig_client = None
+        return ig_client
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def admin_only(func):
+    @wraps(func)
+    def wrapper(update, context, *args, **kwargs):
+        if ADMIN_CHAT_ID and update.effective_user.id != ADMIN_CHAT_ID:
+            update.message.reply_text("❌ Unauthorized user.")
+            return
+        return func(update, context, *args, **kwargs)
+    return wrapper
+
+def generate_code(prefix, existing):
+    n = 1
+    while True:
+        code = f"{prefix}{n}"
+        if code not in existing:
+            return code
+        n += 1
+
+def post_to_instagram(video_path, caption_text):
     try:
-        bot.send_message(ADMIN_CHAT_ID, text)
-    except Exception:
-        logger.exception("Failed to notify admin.")
-
-
-# -----------------------
-# Handler: receive video or document and post to IG
-# -----------------------
-def handle_video(update: Update, context: CallbackContext):
-    msg = update.effective_message
-    user = update.effective_user
-    logger.info("Received message from %s (%s)", user.username if user else "unknown", user.id if user else "?")
-
-    # Accept video or document
-    file_obj = None
-    if msg.video:
-        file_obj = msg.video
-    elif msg.document and (msg.document.mime_type and msg.document.mime_type.startswith("video")):
-        file_obj = msg.document
-    else:
-        msg.reply_text("❌ Please send a video file (as video or as a video document).")
-        return
-
-    # Save original
-    try:
-        remote_file = bot.get_file(file_obj.file_id)
-        orig_filename = f"{file_obj.file_id}.mp4"
-        orig_path = str(VIDEO_DIR / orig_filename)
-        remote_file.download(custom_path=orig_path)
-        msg.reply_text("🎥 Video received. Converting for Instagram...")
-        logger.info("Downloaded video to %s", orig_path)
+        client = ig_login()
+        if not client:
+            print("IG client unavailable.")
+            return False
+        client.video_upload(video_path, caption_text or "")
+        print("✅ Posted:", video_path)
+        return True
     except Exception as e:
-        logger.exception("Failed downloading file: %s", e)
-        msg.reply_text(f"❌ Failed to download video: {e}")
+        print("❌ IG upload failed:", e)
+        return False
+
+# -----------------------------
+# TELEGRAM COMMANDS
+# -----------------------------
+def start_cmd(update, context):
+    update.message.reply_text("🚀 Instagram Scheduler Bot is online!\nUse /viewallcmd for full commands.")
+
+def viewallcmd_cmd(update, context):
+    msg = (
+        "📘 *ALL COMMANDS*\n"
+        "──────────────────────────────\n"
+        "🎬 *VIDEO QUEUE*\n"
+        "`/addvideo` — Upload a normal video.\n"
+        "`/addpriority` — Upload a priority video.\n"
+        "`/list` — List all videos.\n"
+        "`/remove <vid>` — Remove a video.\n\n"
+        "🏷️ *CAPTION*\n"
+        "`/setcaption <text>` — Set caption.\n"
+        "`/viewcaption` — View caption.\n"
+        "`/removecaption` — Remove caption.\n\n"
+        "🕒 *POSTING*\n"
+        "`/settimer <min> <max>` — Set posting interval (sec)\n"
+        "`/startposting` — Start auto posting.\n"
+        "`/stopposting` — Stop auto posting.\n"
+        "`/status` — View system status.\n\n"
+        "🗓️ *SCHEDULER*\n"
+        "`/schedule` — Schedule post (video → caption → time)\n"
+        "`/listscheduled` — View scheduled posts.\n"
+        "`/removescheduled <code>` — Remove scheduled post.\n\n"
+        "📊 *UTILITY*\n"
+        "`/viewallcmd` — This help panel.\n"
+    )
+    update.message.reply_text(msg, parse_mode="Markdown")
+
+@admin_only
+def addvideo(update, context):
+    update.message.reply_text("📥 Send the video to add.")
+    context.user_data["type"] = "normal"
+
+@admin_only
+def addpriority(update, context):
+    update.message.reply_text("📥 Send the PRIORITY video.")
+    context.user_data["type"] = "priority"
+
+def receive_video(update, context):
+    msg = update.message
+    if not msg.video and not msg.document:
         return
+    file_obj = msg.video or msg.document
+    file = context.bot.get_file(file_obj.file_id)
+    code = generate_code("vid", [v["code"] for v in data["videos"]])
+    path = os.path.join(VIDEO_DIR, f"{code}.mp4")
+    file.download(path)
+    vtype = context.user_data.get("type", "normal")
+    data["videos"].append({"code": code, "path": path, "type": vtype})
+    save_data(data)
+    update.message.reply_text(f"✅ Saved {code} ({vtype})")
 
-    # Convert
-    converted_filename = f"converted_{file_obj.file_id}.mp4"
-    converted_path = str(VIDEO_DIR / converted_filename)
-    ok = convert_video_to_ig(orig_path, converted_path)
-    if not ok:
-        msg.reply_text("❌ Conversion failed. Check server logs.")
+def list_cmd(update, context):
+    vs = data["videos"]
+    if not vs:
+        update.message.reply_text("No videos found.")
         return
+    lines = [f"{v['code']} - {v['type']}" for v in vs]
+    update.message.reply_text("🎬 Videos:\n" + "\n".join(lines))
 
-    # Ensure IG logged in
-    cl = ig_login()
-    if cl is None:
-        msg.reply_text("⚠️ Instagram client not logged in. Use /login or check admin for details.")
+def setcaption_cmd(update, context):
+    text = " ".join(context.args)
+    if not text:
+        update.message.reply_text("Usage: /setcaption <text>")
         return
+    data["caption"] = text
+    save_data(data)
+    update.message.reply_text("✅ Caption updated.")
 
-    # Upload
-    try:
-        caption = "Uploaded via bot"
-        msg.reply_text("📤 Uploading to Instagram...")
-        # Use feed video upload; if you want reel use clip_upload
-        cl.video_upload(converted_path, caption)
-        msg.reply_text("✅ Successfully posted to Instagram!")
-        logger.info("Uploaded to IG: %s", converted_path)
-    except Exception as e:
-        logger.exception("Instagram upload failed: %s", e)
-        msg.reply_text(f"❌ Instagram upload failed: {e}")
-        # optionally notify admin
-        notify_admin(f"⚠️ IG upload failed:\n{e}")
+def viewcaption_cmd(update, context):
+    update.message.reply_text(f"📜 {data.get('caption','(none)')}")
 
+def removecaption_cmd(update, context):
+    data["caption"] = ""
+    save_data(data)
+    update.message.reply_text("❌ Caption removed.")
 
-# Register Telegram handler
-dispatcher.add_handler(MessageHandler(Filters.video | Filters.document, handle_video))
+def settimer_cmd(update, context):
+    args = context.args
+    if len(args) != 2:
+        update.message.reply_text("Usage: /settimer <min> <max>")
+        return
+    mn, mx = int(args[0]), int(args[1])
+    data["interval_min"] = mn
+    data["interval_max"] = mx
+    save_data(data)
+    update.message.reply_text(f"⏱️ Interval set: {mn}-{mx}s")
 
+def startposting_cmd(update, context):
+    data["is_running"] = True
+    next_t = datetime.now() + timedelta(seconds=random.randint(data["interval_min"], data["interval_max"]))
+    data["next_queue_post_time"] = next_t.isoformat()
+    save_data(data)
+    update.message.reply_text("🚀 Auto-posting started!")
 
-# -----------------------
-# /login command endpoint
-# -----------------------
-from telegram.ext import CommandHandler
+def stopposting_cmd(update, context):
+    data["is_running"] = False
+    save_data(data)
+    update.message.reply_text("🛑 Auto-posting stopped.")
 
+def status_cmd(update, context):
+    txt = (
+        f"📊 STATUS:\n"
+        f"Mode: {'Running ✅' if data['is_running'] else 'Stopped ❌'}\n"
+        f"Videos: {len(data['videos'])}\n"
+        f"Caption: {data.get('caption','')}\n"
+        f"Next Post: {data.get('next_queue_post_time')}\n"
+    )
+    update.message.reply_text(txt)
 
-def login_cmd(update: Update, context: CallbackContext):
-    update.message.reply_text("🔐 Attempting Instagram login (server-side)...")
-    cl = ig_login(force=True)
-    if cl:
-        update.message.reply_text("✅ Instagram login successful (session saved).")
-    else:
-        update.message.reply_text("❌ Instagram login failed — check logs and solve any challenge in the IG app.")
+# -----------------------------
+# BACKGROUND WORKER
+# -----------------------------
+def weighted_choice(videos):
+    weighted = []
+    for v in videos:
+        if v["type"] == "priority":
+            weighted.extend([v] * 3)
+        else:
+            weighted.append(v)
+    return random.choice(weighted) if weighted else None
 
+def background_worker():
+    print("🧠 Background worker running...")
+    while True:
+        try:
+            now = datetime.now()
+            # handle scheduled posts
+            for s in data.get("scheduled", []):
+                if s.get("status") == "Pending":
+                    dt = datetime.fromisoformat(s["datetime"])
+                    if now >= dt:
+                        success = post_to_instagram(s["video_path"], s.get("caption"))
+                        s["status"] = "Posted" if success else "Failed"
+                        save_data(data)
+            # handle queue
+            if data.get("is_running"):
+                nxt = data.get("next_queue_post_time")
+                if not nxt or now >= datetime.fromisoformat(nxt):
+                    vid = weighted_choice(data.get("videos", []))
+                    if vid:
+                        success = post_to_instagram(vid["path"], data.get("caption"))
+                        if success:
+                            data["last_post"] = {"video_code": vid["code"], "time": datetime.now().isoformat()}
+                        data["next_queue_post_time"] = (datetime.now() + timedelta(
+                            seconds=random.randint(data["interval_min"], data["interval_max"])
+                        )).isoformat()
+                        save_data(data)
+            time.sleep(5)
+        except Exception as e:
+            print("Worker error:", e)
+            time.sleep(5)
 
-dispatcher.add_handler(CommandHandler("login", login_cmd))
-
-
-# -----------------------
-# Webhook route
-# -----------------------
+# -----------------------------
+# FLASK WEBHOOK
+# -----------------------------
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    try:
-        upd = Update.de_json(request.get_json(force=True), bot)
-        dispatcher.process_update(upd)
-    except Exception:
-        logger.exception("Failed to process update")
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
     return "OK", 200
-
 
 @app.route("/", methods=["GET", "HEAD"])
 def index():
-    return "🤖 InstaAutomation (webhook) is up", 200
+    return "🤖 Insta Scheduler Bot Running!", 200
 
+# -----------------------------
+# STARTUP
+# -----------------------------
+def main():
+    dispatcher.add_handler(CommandHandler("start", start_cmd))
+    dispatcher.add_handler(CommandHandler("viewallcmd", viewallcmd_cmd))
+    dispatcher.add_handler(CommandHandler("addvideo", addvideo))
+    dispatcher.add_handler(CommandHandler("addpriority", addpriority))
+    dispatcher.add_handler(MessageHandler(Filters.video | Filters.document, receive_video))
+    dispatcher.add_handler(CommandHandler("list", list_cmd))
+    dispatcher.add_handler(CommandHandler("setcaption", setcaption_cmd))
+    dispatcher.add_handler(CommandHandler("viewcaption", viewcaption_cmd))
+    dispatcher.add_handler(CommandHandler("removecaption", removecaption_cmd))
+    dispatcher.add_handler(CommandHandler("settimer", settimer_cmd))
+    dispatcher.add_handler(CommandHandler("startposting", startposting_cmd))
+    dispatcher.add_handler(CommandHandler("stopposting", stopposting_cmd))
+    dispatcher.add_handler(CommandHandler("status", status_cmd))
 
-# -----------------------
-# Startup
-# -----------------------
-def run_flask():
-    # set debug False in production
-    app.run(host="0.0.0.0", port=PORT)
-
+    threading.Thread(target=background_worker, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
 if __name__ == "__main__":
-    logger.info("📂 Video folder ready: %s", VIDEO_DIR)
-    # try to login once at startup (non-blocking)
-    threading.Thread(target=ig_login, daemon=True).start()
-    logger.info("🚀 Starting Flask webhook server on port %s", PORT)
-    run_flask()
+    main()
