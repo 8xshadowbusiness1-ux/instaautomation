@@ -40,10 +40,28 @@ session_path = os.path.join(VIDEO_DIR, "ig_session.json")
 try:
     if os.path.exists(session_path):
         cl.load_settings(session_path)
-        cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        try:
+    cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+except Exception as e:
+    print("⚠️ Login challenge detected:", e)
+    try:
+        cl.challenge_resolve()
+        print("✅ Challenge automatically resolved (using saved session or trust)")
+    except Exception as inner:
+        print("❌ Challenge resolve failed — please verify on your Instagram app manually once.")
+
         print("✅ Loaded existing Instagram session")
     else:
-        cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+       try:
+    cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+except Exception as e:
+    print("⚠️ Login challenge detected:", e)
+    try:
+        cl.challenge_resolve()
+        print("✅ Challenge automatically resolved (using saved session or trust)")
+    except Exception as inner:
+        print("❌ Challenge resolve failed — please verify on your Instagram app manually once.")
+
         cl.dump_settings(session_path)
         print("✅ New Instagram session created")
 except Exception as e:
@@ -175,3 +193,4 @@ if __name__ == "__main__":
 
     print("🚀 Starting Telegram webhook bot...")
     app.run(host="0.0.0.0", port=START_PORT)
+
