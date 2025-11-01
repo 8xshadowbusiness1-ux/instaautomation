@@ -433,27 +433,19 @@ def status_cmd(update, context):
 # MAIN FUNCTION
 # -----------------------------
 def main():
-    print("🚀 Starting bot...")
+    print("🚀 Starting bot (webhook mode)...")
 
-    # SINGLE INSTANCE FIX
-    try:
-        print("Ensuring single instance mode...")
-        from telegram import Bot
-        Bot(token=BOT_TOKEN).delete_webhook(drop_pending_updates=True)
-        print("✅ Previous sessions cleared.")
-    except Exception as e:
-        print("⚠️ Webhook cleanup error:", e)
-
-    # KEEP-ALIVE THREAD
+    # KEEP ALIVE THREAD
     threading.Thread(target=keep_alive_ping, daemon=True).start()
 
     # BACKGROUND WORKER
     threading.Thread(target=background_worker, daemon=True).start()
 
-    # TELEGRAM BOT
+    # TELEGRAM BOT SETUP
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
+    # Command handlers
     dp.add_handler(CommandHandler("start", start_cmd))
     dp.add_handler(CommandHandler("help", help_cmd))
     dp.add_handler(CommandHandler("viewallcmd", viewallcmd_cmd))
@@ -472,10 +464,27 @@ def main():
     dp.add_handler(CommandHandler("addpriority", addpriority_start))
     dp.add_handler(MessageHandler(Filters.video | Filters.document, receive_video_for_add))
 
-    updater.start_polling()
-    print("✅ Bot started and polling for updates.")
+    # -----------------------------------
+    # ✅ SWITCH TO WEBHOOK MODE
+    # -----------------------------------
+    PORT = int(os.environ.get('PORT', '8443'))
+    APP_URL = os.getenv("MY_RENDER_URL")
+    if not APP_URL:
+        raise RuntimeError("❌ MY_RENDER_URL environment variable not set!")
+
+    updater.bot.delete_webhook()
+    time.sleep(1)
+    updater.start_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{APP_URL}/{BOT_TOKEN}"
+    )
+
+    print(f"✅ Webhook started at {APP_URL}/{BOT_TOKEN}")
     updater.idle()
 
 
 if __name__ == "__main__":
     main()
+
