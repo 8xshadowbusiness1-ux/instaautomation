@@ -96,16 +96,22 @@ def _safe_run(fn,u,c,*a,**k):
 def download_random_video(username):
     cl = ig_login()
     if not cl:
-        return False, "Login fail"
+        return False, "Login failed"
     try:
         uid = cl.user_id_from_username(username)
         medias = cl.user_medias(uid, 30)
         vids = [m for m in medias if getattr(m, "video_url", None)]
         if not vids:
-            return False, "No video found"
+            return False, "No videos found"
         ch = random.choice(vids)
-        path = os.path.join(VIDEO_DIR, f"autoz_{username}_{int(time.time())}.mp4")
-        os.makedirs(os.path.dirname(path), exist_ok=True)  # ✅ Create directory safely
+
+        os.makedirs(VIDEO_DIR, exist_ok=True)
+        filename = f"autoz_{username}_{int(time.time())}.mp4"
+        path = os.path.join(VIDEO_DIR, filename)
+
+        # ✅ Force correct path format
+        path = path.replace("//", "/")
+
         cl.video_download(ch.pk, path)
         return True, path
     except Exception as e:
@@ -317,6 +323,7 @@ def main():
             traceback.print_exc(); time.sleep(2)
 
 if __name__=="__main__": main()
+
 
 
 
