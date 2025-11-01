@@ -1057,7 +1057,7 @@ def main():
             # To avoid complicated dual-server issues and ensure no conflicts, we WILL start polling (safe because we deleted webhook earlier) .
             # If you want true webhook serving by Flask, extra code is needed to forward the update JSON into dp.process_update.
             updater.start_polling()
-         print("✅ Bot polling started successfully!")
+            print("✅ Bot polling started successfully!")
 
             print("Fallback: started polling after webhook set (works in many deploys).")
         else:
@@ -1086,4 +1086,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
