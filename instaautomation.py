@@ -94,22 +94,24 @@ def _safe_run(fn,u,c,*a,**k):
 
 # === CORE AUTOZ ===
 def download_random_video(username):
-    cl=ig_login()
-    if not cl: return False,"Login fail"
+    cl = ig_login()
+    if not cl:
+        return False, "Login fail"
     try:
-        uid=cl.user_id_from_username(username)
-        medias=cl.user_medias(uid,30)
-        vids=[m for m in medias if getattr(m,"video_url",None)]
-        if not vids: return False,"No video found"
-        ch=random.choice(vids)
+        uid = cl.user_id_from_username(username)
+        medias = cl.user_medias(uid, 30)
+        vids = [m for m in medias if getattr(m, "video_url", None)]
+        if not vids:
+            return False, "No video found"
+        ch = random.choice(vids)
         path = os.path.join(VIDEO_DIR, f"autoz_{username}_{int(time.time())}.mp4")
-os.makedirs(os.path.dirname(path), exist_ok=True)
-        cl.video_download(ch.pk,path)
-        return True,path
+        os.makedirs(os.path.dirname(path), exist_ok=True)  # ✅ Create directory safely
+        cl.video_download(ch.pk, path)
+        return True, path
     except Exception as e:
         traceback.print_exc()
-        return False,str(e)
-
+        return False, str(e)
+        
 def post_to_ig(path):
     cl=ig_login()
     if not cl: return False,"Login fail"
@@ -315,5 +317,6 @@ def main():
             traceback.print_exc(); time.sleep(2)
 
 if __name__=="__main__": main()
+
 
 
