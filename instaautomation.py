@@ -102,7 +102,8 @@ def download_random_video(username):
         vids=[m for m in medias if getattr(m,"video_url",None)]
         if not vids: return False,"No video found"
         ch=random.choice(vids)
-        path=os.path.join(VIDEO_DIR,f"autoz_{username}_{int(time.time())}.mp4")
+        path = os.path.join(VIDEO_DIR, f"autoz_{username}_{int(time.time())}.mp4")
+os.makedirs(os.path.dirname(path), exist_ok=True)
         cl.video_download(ch.pk,path)
         return True,path
     except Exception as e:
@@ -314,4 +315,5 @@ def main():
             traceback.print_exc(); time.sleep(2)
 
 if __name__=="__main__": main()
+
 
