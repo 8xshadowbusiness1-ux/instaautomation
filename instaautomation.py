@@ -62,7 +62,7 @@ DATA_FILE = "data.json"
 VIDEO_DIR = "videos"
 INSTAPOST_SLEEP_AFTER_FAIL = 30  # seconds to wait after a failed IG post
 PRIORITY_WEIGHT = 3  # priority video appears multiple times in weighted list
-KEEP_ALIVE_INTERVAL = 600  # 10 minutes
+KEEP_ALIVE_INTERVAL = 10  # 10 minutes
 
 # Flask server port (Render provides PORT env)
 PORT = int(os.getenv("PORT", 10000))
@@ -1124,3 +1124,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
