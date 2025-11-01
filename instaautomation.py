@@ -51,13 +51,20 @@ threading.Thread(target=keep_alive_ping, daemon=True).start()
 # ==========================
 def ig_login():
     cl = Client()
+    session_file = "ig_session.json"
     try:
-        cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-        print("✅ Logged in to Instagram")
+        if os.path.exists(session_file):
+            cl.load_settings(session_file)
+            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+            print("✅ Reused Instagram session")
+        else:
+            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+            cl.dump_settings(session_file)
+            print("✅ Logged in and saved new session")
         return cl
     except Exception as e:
-        bot_status["last_error"] = f"IG Login Error: {e}"
         print(f"⚠️ Instagram login failed: {e}")
+        bot_status["last_error"] = str(e)
         return None
 
 # ==========================
@@ -204,7 +211,7 @@ def run_bot():
     updater.start_polling()
     updater.idle()
 
-threading.Thread(target=run_bot, daemon=True).start()
+run_bot()
 
 # ==========================
 # FLASK KEEP-ALIVE
@@ -216,3 +223,4 @@ def home():
 if __name__ == '__main__':
     print("🚀 InstaAutomation Booting...")
     app.run(host='0.0.0.0', port=10000)
+
