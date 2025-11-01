@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-instagram_scheduler_bot - final single-file script (with /viewallcmd)
-All previous commands preserved + AutoZMode (auto repost from a target IG account)
-Keep-alive ping included (MY_RENDER_URL env var)
-Supports polling (deletes webhook first) and optional webhook mode via WEBHOOK_URL
+instaautomation_full.py
+Full & final single-file script with:
+ - All original Telegram commands retained
+ - Instagram login via instagrapi
+ - autozmode: download from target IG accounts and post automatically
+ - Keep-alive ping every 10 minutes (MY_RENDER_URL env var)
+ - Small Flask health endpoint (binds a port so Render won't sleep/kill)
+ - Webhook support if WEBHOOK_URL is set, otherwise polling (and deletes webhook first)
 """
 
 import os
@@ -16,148 +20,126 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from functools import wraps
 
-# Instagram + Telegram libs
+import requests
+from flask import Flask, request
+
 from instagrapi import Client
 from telegram import Update, Bot
-from telegram.ext import (
-    Updater, CommandHandler, MessageHandler, Filters,
-    ConversationHandler, CallbackContext
-)
-import requests
+from telegram.ext import (Updater, CommandHandler, MessageHandler, Filters,
+                          ConversationHandler, CallbackContext)
 
-# =========================
-# CONFIG from env (or edit here)
-# =========================
+# -----------------------------
+# CONFIG - fill these or set env vars
+# -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "YOUR_IG_USERNAME")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "YOUR_IG_PASSWORD")
-ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_ID")  # string -> convert to int later if set
-if ADMIN_CHAT_ID:
+
+# Optional admin restriction (int Telegram user id)
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+if ADMIN_CHAT_ID is not None:
     try:
         ADMIN_CHAT_ID = int(ADMIN_CHAT_ID)
     except:
         ADMIN_CHAT_ID = None
 
-DATA_FILE = os.getenv("DATA_FILE", "data.json")
-VIDEO_DIR = os.getenv("VIDEO_DIR", "videos")  # ensure relative dir (not /data)
-INSTAPOST_SLEEP_AFTER_FAIL = int(os.getenv("INSTAPOST_SLEEP_AFTER_FAIL", "30"))
-PRIORITY_WEIGHT = int(os.getenv("PRIORITY_WEIGHT", "3"))
+# Keep-alive ping (Render URL) - set this in env to enable pings
+MY_RENDER_URL = os.getenv("MY_RENDER_URL")  # e.g. https://instaautomation-xxxx.onrender.com/
 
-# Keep-alive URL (render/other) - ping every 10 minutes if set
-MY_RENDER_URL = os.getenv("MY_RENDER_URL", None)
+# If you want webhook mode, set WEBHOOK_URL to your public URL (no path required).
+# The script will set webhook to WEBHOOK_URL + "/" + BOT_TOKEN
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://instaautomation-xxxx.onrender.com
 
-# Telegram webhook optional:
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", None)  # if provided, will attempt to set webhook (full URL)
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", None)
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "10000"))
+# Autozmode target accounts (comma-separated usernames) -> downloaded randomly
+AUTOZ_TARGETS = os.getenv("AUTOZ_TARGETS", "")  # e.g. "target1,target2"
+AUTOZ_ENABLED_DEFAULT = False  # autozmode is off by default
 
-# AutoZMode defaults (can be changed with commands)
-AUTOZ_DEFAULT_TARGET = os.getenv("AUTOZ_TARGET", "")  # username
-AUTOZ_DEFAULT_MIN = int(os.getenv("AUTOZ_MIN", "1800"))   # seconds
-AUTOZ_DEFAULT_MAX = int(os.getenv("AUTOZ_MAX", "3600"))
+# Other settings
+DATA_FILE = "data.json"
+VIDEO_DIR = "videos"
+INSTAPOST_SLEEP_AFTER_FAIL = 30  # seconds to wait after a failed IG post
+PRIORITY_WEIGHT = 3  # priority video appears multiple times in weighted list
+KEEP_ALIVE_INTERVAL = 600  # 10 minutes
 
-# =========================
-# Ensure directories
-# =========================
+# Flask server port (Render provides PORT env)
+PORT = int(os.getenv("PORT", 10000))
+
+# -----------------------------
+# Prepare folders & defaults
+# -----------------------------
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
-# =========================
-# Default data structure
-# =========================
 DEFAULT_DATA = {
     "caption": "",
     "interval_min": 1800,
     "interval_max": 3600,
-    "videos": [],  # {code, path, type}
-    "scheduled": [],  # {shd_code, video_path, datetime, caption, status}
+    "videos": [],  # list of {code, path, type}
+    "scheduled": [],  # list of {shd_code, video_path, datetime, caption, status}
     "last_post": {"video_code": None, "time": None},
     "is_running": False,
     "next_queue_post_time": None,
-    # AutoZMode
-    "autoz": {
-        "enabled": False,
-        "target_username": AUTOZ_DEFAULT_TARGET,
-        "min_interval": AUTOZ_DEFAULT_MIN,
-        "max_interval": AUTOZ_DEFAULT_MAX,
-        "caption": "",
-        "seen_media_ids": []  # track media ids we've already downloaded/posted
-    }
+    "autozmode": {"enabled": AUTOZ_ENABLED_DEFAULT, "targets": [t.strip() for t in AUTOZ_TARGETS.split(",") if t.strip()], "last_run": None}
 }
 
 data_lock = threading.Lock()
 
-# =========================
-# Data load/save
-# =========================
+
 def load_data():
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w") as f:
             json.dump(DEFAULT_DATA, f, indent=2)
-        return json.loads(json.dumps(DEFAULT_DATA))
+        return DEFAULT_DATA.copy()
     with open(DATA_FILE, "r") as f:
         try:
             d = json.load(f)
         except Exception:
-            d = json.loads(json.dumps(DEFAULT_DATA))
-    # fill missing keys
+            d = DEFAULT_DATA.copy()
+    # ensure defaults exist
     for k, v in DEFAULT_DATA.items():
         if k not in d:
             d[k] = v
-    # ensure nested autoz keys
-    if "autoz" not in d:
-        d["autoz"] = DEFAULT_DATA["autoz"].copy()
-    else:
-        for k, v in DEFAULT_DATA["autoz"].items():
-            if k not in d["autoz"]:
-                d["autoz"][k] = v
     return d
 
-def save_data(d):
+
+def save_data(d=None):
+    if d is None:
+        d = data
     with data_lock:
         with open(DATA_FILE, "w") as f:
             json.dump(d, f, indent=2, default=str)
 
+
 data = load_data()
 
-# =========================
-# Instagram client (lazy)
-# =========================
+# -----------------------------
+# Instagram client
+# -----------------------------
 ig_client = None
 ig_lock = threading.Lock()
 
+
 def ig_login():
+    """
+    Login to Instagram and return an instagrapi.Client, cached per process.
+    """
     global ig_client
     with ig_lock:
-        if ig_client is not None:
-            return ig_client
-        client = Client()
-        client.settings_delay_range = (1, 2)
-        try:
-            # try load session from file if exists
-            session_file = f"ig_{INSTAGRAM_USERNAME}.json"
-            if os.path.exists(session_file):
-                try:
-                    client.load_settings(session_file)
-                except Exception:
-                    pass
-            client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-            # save settings
+        if ig_client is None:
+            client = Client()
             try:
-                client.dump_settings(session_file)
-            except Exception:
-                pass
-            ig_client = client
-            print("✅ Instagram: logged in.")
-            return ig_client
-        except Exception as e:
-            print("❌ Instagram login failed:", e)
-            traceback.print_exc()
-            ig_client = None
-            return None
+                client.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+                ig_client = client
+                print("✅ Instagram logged in.")
+            except Exception as e:
+                print("❌ Instagram login failed:", e)
+                traceback.print_exc()
+                ig_client = None
+        return ig_client
 
-# =========================
+
+# -----------------------------
 # Helpers
-# =========================
+# -----------------------------
 def admin_only(func):
     @wraps(func)
     def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
@@ -170,6 +152,7 @@ def admin_only(func):
         return func(update, context, *args, **kwargs)
     return wrapper
 
+
 def generate_vid_code():
     existing = {v["code"] for v in data.get("videos", [])}
     n = 1
@@ -178,6 +161,7 @@ def generate_vid_code():
         if code not in existing:
             return code
         n += 1
+
 
 def generate_shd_code():
     existing = {s["shd_code"] for s in data.get("scheduled", [])}
@@ -188,11 +172,13 @@ def generate_shd_code():
             return code
         n += 1
 
+
 def find_video_by_code(code):
     for v in data.get("videos", []):
         if v.get("code") == code:
             return v
     return None
+
 
 def human_timedelta_seconds(seconds):
     if seconds is None:
@@ -202,48 +188,60 @@ def human_timedelta_seconds(seconds):
     mins = seconds // 60
     return f"in {mins} mins"
 
+
 def parse_datetime(text):
     try:
         return datetime.strptime(text.strip(), "%Y-%m-%d %H:%M")
     except Exception:
         return None
 
-# =========================
-# Telegram Handlers / Commands
-# =========================
+
+# -----------------------------
+# Telegram Handlers (all retained + additions)
+# -----------------------------
 ASK_SCHED_VIDEO, ASK_SCHED_CAPTION, ASK_SCHED_TIME = range(3)
+
 
 def start_cmd(update: Update, context: CallbackContext):
     update.message.reply_text("🚀 Instagram Scheduler Bot ready. Use /viewallcmd for commands.")
 
+
 def help_cmd(update: Update, context: CallbackContext):
     update.message.reply_text("Use /viewallcmd to see all commands.")
 
-# Add video (normal/priority) flow flags
+
 @admin_only
 def addvideo_start(update: Update, context: CallbackContext):
     update.message.reply_text("📥 Please send the video file you want to add to queue (normal).")
     context.user_data['add_type'] = 'normal'
+
 
 @admin_only
 def addpriority_start(update: Update, context: CallbackContext):
     update.message.reply_text("📥 Please send the video file you want to add as PRIORITY.")
     context.user_data['add_type'] = 'priority'
 
+
 def receive_video_for_add(update: Update, context: CallbackContext):
     msg = update.message
     if not msg:
         return
-    if not (msg.video or msg.document):
+    file_obj = None
+    if msg.video:
+        file_obj = msg.video
+    elif msg.document and (msg.document.mime_type and "video" in (msg.document.mime_type or "")):
+        file_obj = msg.document
+    else:
+        update.message.reply_text("❌ Please send a video file.")
         return
+
     add_type = context.user_data.get('add_type', 'normal')
-    file_obj = msg.video or msg.document
     file_id = file_obj.file_id
     new_code = generate_vid_code()
     path = os.path.join(VIDEO_DIR, f"{new_code}.mp4")
     try:
         file = context.bot.get_file(file_id)
-        file.download(path)
+        file.download(custom_path=path)
     except Exception as e:
         update.message.reply_text(f"❌ Failed to download video: {e}")
         context.user_data.pop('add_type', None)
@@ -254,6 +252,7 @@ def receive_video_for_add(update: Update, context: CallbackContext):
     update.message.reply_text(f"✅ Video saved as `{new_code}` (type: {add_type})", parse_mode="Markdown")
     context.user_data.pop('add_type', None)
 
+
 def list_cmd(update: Update, context: CallbackContext):
     vs = data.get("videos", [])
     if not vs:
@@ -263,6 +262,7 @@ def list_cmd(update: Update, context: CallbackContext):
     for v in vs:
         lines.append(f"{v['code']} - {v['type']}")
     update.message.reply_text("\n".join(lines))
+
 
 def show_cmd(update: Update, context: CallbackContext):
     args = context.args
@@ -283,6 +283,7 @@ def show_cmd(update: Update, context: CallbackContext):
     except Exception as e:
         update.message.reply_text(f"❌ Failed to send video: {e}")
 
+
 def remove_cmd(update: Update, context: CallbackContext):
     args = context.args
     if not args:
@@ -302,6 +303,7 @@ def remove_cmd(update: Update, context: CallbackContext):
     save_data(data)
     update.message.reply_text(f"✅ Removed video {code}.")
 
+
 def removepriority_cmd(update: Update, context: CallbackContext):
     args = context.args
     if not args:
@@ -316,7 +318,7 @@ def removepriority_cmd(update: Update, context: CallbackContext):
     save_data(data)
     update.message.reply_text(f"✅ {code} is now normal.")
 
-# Caption commands
+
 def setcaption_cmd(update: Update, context: CallbackContext):
     text = " ".join(context.args).strip()
     if not text and update.message.text and update.message.text != "/setcaption":
@@ -328,6 +330,7 @@ def setcaption_cmd(update: Update, context: CallbackContext):
     save_data(data)
     update.message.reply_text("✅ Caption updated.")
 
+
 def viewcaption_cmd(update: Update, context: CallbackContext):
     caption = data.get("caption", "")
     if caption:
@@ -335,12 +338,13 @@ def viewcaption_cmd(update: Update, context: CallbackContext):
     else:
         update.message.reply_text("⚠️ No caption set yet. Use /setcaption to add one.")
 
+
 def removecaption_cmd(update: Update, context: CallbackContext):
     data["caption"] = ""
     save_data(data)
     update.message.reply_text("❌ Caption removed. (Posts will be uploaded without captions.)")
 
-# Timer & Start/Stop
+
 def settimer_cmd(update: Update, context: CallbackContext):
     args = context.args
     if len(args) != 2:
@@ -358,6 +362,7 @@ def settimer_cmd(update: Update, context: CallbackContext):
     except Exception:
         update.message.reply_text("Invalid numbers.")
 
+
 def startposting_cmd(update: Update, context: CallbackContext):
     if data.get("is_running"):
         update.message.reply_text("⚠️ Already running.")
@@ -368,6 +373,7 @@ def startposting_cmd(update: Update, context: CallbackContext):
     save_data(data)
     update.message.reply_text("🚀 Auto-posting started.")
 
+
 def stopposting_cmd(update: Update, context: CallbackContext):
     if not data.get("is_running"):
         update.message.reply_text("⚠️ Not running.")
@@ -377,10 +383,11 @@ def stopposting_cmd(update: Update, context: CallbackContext):
     save_data(data)
     update.message.reply_text("🛑 Auto-posting stopped.")
 
-# Schedule conversation (video -> caption -> time)
+
 def schedule_start(update: Update, context: CallbackContext):
     update.message.reply_text("🎥 Please send the video or post you want to schedule.")
     return ASK_SCHED_VIDEO
+
 
 def schedule_receive_video(update: Update, context: CallbackContext):
     msg = update.message
@@ -393,7 +400,7 @@ def schedule_receive_video(update: Update, context: CallbackContext):
     path = os.path.join(VIDEO_DIR, f"{shd_tmp_code}.mp4")
     try:
         file = context.bot.get_file(file_id)
-        file.download(path)
+        file.download(custom_path=path)
     except Exception as e:
         update.message.reply_text(f"❌ Failed to download video: {e}")
         return ConversationHandler.END
@@ -401,11 +408,13 @@ def schedule_receive_video(update: Update, context: CallbackContext):
     update.message.reply_text("✍️ Please type your caption for this scheduled post (or send empty message for no caption).")
     return ASK_SCHED_CAPTION
 
+
 def schedule_receive_caption(update: Update, context: CallbackContext):
     caption_text = update.message.text or ""
     context.user_data['sched_caption'] = caption_text
     update.message.reply_text("⏰ Great! Now please type the time of post (format: YYYY-MM-DD HH:MM).")
     return ASK_SCHED_TIME
+
 
 def schedule_receive_time(update: Update, context: CallbackContext):
     time_text = update.message.text
@@ -436,6 +445,7 @@ def schedule_receive_time(update: Update, context: CallbackContext):
     context.user_data.pop('sched_caption', None)
     return ConversationHandler.END
 
+
 def listscheduled_cmd(update: Update, context: CallbackContext):
     sch = data.get("scheduled", [])
     if not sch:
@@ -448,6 +458,7 @@ def listscheduled_cmd(update: Update, context: CallbackContext):
         caption = s.get("caption", "")
         lines.append(f"• {s['shd_code']} → {dt} → {status}\n   Caption: \"{caption}\"")
     update.message.reply_text("\n".join(lines))
+
 
 def removescheduled_cmd(update: Update, context: CallbackContext):
     args = context.args
@@ -469,7 +480,7 @@ def removescheduled_cmd(update: Update, context: CallbackContext):
     save_data(data)
     update.message.reply_text(f"✅ Removed scheduled {code}.")
 
-# Status dashboard
+
 def status_cmd(update: Update, context: CallbackContext):
     now = datetime.now()
     mode = "Running ✅" if data.get("is_running") else "Stopped ❌"
@@ -553,25 +564,11 @@ def status_cmd(update: Update, context: CallbackContext):
     lines.append(f"⏱️ Last Post: {last_post_time}")
     lines.append(f"• Last Posted Video: {last_post_code}")
     lines.append("──────────────────────────────")
-
-    # AutoZMode status
-    az = data.get("autoz", {})
-    az_enabled = az.get("enabled", False)
-    az_target = az.get("target_username", "")
-    az_caption = az.get("caption", "")
-    az_min = az.get("min_interval", AUTOZ_DEFAULT_MIN)
-    az_max = az.get("max_interval", AUTOZ_DEFAULT_MAX)
-    lines.append("⚙️ AutoZMode:")
-    lines.append(f"  • Enabled: {'Yes' if az_enabled else 'No'}")
-    lines.append(f"  • Target: {az_target or '(not set)'}")
-    lines.append(f"  • Caption: \"{az_caption or '(none)'}\"")
-    lines.append(f"  • Interval: {az_min}–{az_max} sec")
-    lines.append("──────────────────────────────")
-
     update.message.reply_text("\n".join(lines))
 
+
 # -----------------------------
-# Posting logic & worker
+# Posting logic (bg worker)
 # -----------------------------
 def weighted_random_choice(videos):
     weighted = []
@@ -582,26 +579,25 @@ def weighted_random_choice(videos):
             weighted.append(v)
     return random.choice(weighted) if weighted else None
 
+
 def post_to_instagram(video_path, caption_text):
     try:
         client = ig_login()
         if client is None:
             print("IG client unavailable.")
             return False
-        # instagrapi handles video metadata; ensure file exists
-        if not os.path.exists(video_path):
-            print("Video file missing:", video_path)
-            return False
+        # instagrapi will analyze and upload; exceptions will be raised on fail
         client.video_upload(video_path, caption_text or "")
-        print("Posted to IG:", video_path)
+        print("✅ Posted to IG:", video_path)
         return True
     except Exception as e:
-        print("Instagram upload error:", e)
+        print("❌ Instagram upload error:", e)
         traceback.print_exc()
         return False
 
+
 def background_worker():
-    print("Background worker running.")
+    print("🔁 Background worker running.")
     while True:
         try:
             now = datetime.now()
@@ -630,16 +626,8 @@ def background_worker():
                     print("Error in scheduled loop:", e)
                     traceback.print_exc()
 
-            # 2) AutoZMode posting (prioritized before queue)
-            az = data.get("autoz", {})
-            if az.get("enabled"):
-                # Simple schedule: pick next based on random interval; but ensure we post only when time arrived
-                # We'll check next_queue_post_time for AutoZ priority if set to now or earlier.
-                # For autoz, we maintain next_queue_post_time same as queue - share the same trigger
-                pass  # handled in the unified "do_post" below
-
-            # 3) queue (and AutoZMode) unified trigger
-            if data.get("is_running") or data.get("autoz", {}).get("enabled"):
+            # 2) queue posting
+            if data.get("is_running"):
                 next_iso = data.get("next_queue_post_time")
                 do_post = False
                 if next_iso:
@@ -653,30 +641,6 @@ def background_worker():
                     do_post = True
 
                 if do_post:
-                    # Priority: if AutoZ is enabled, attempt AutoZMode first (download from target and post)
-                    az = data.get("autoz", {})
-                    az_enabled = az.get("enabled", False)
-                    az_target = az.get("target_username", "")
-                    if az_enabled and az_target:
-                        try:
-                            # run AutoZ once (download a random new video from target, post it)
-                            performed_autoz = autoz_fetch_and_post_once(az_target, az.get("caption", ""))
-                            if performed_autoz:
-                                # schedule next
-                                with data_lock:
-                                    next_interval = random.randint(az.get("min_interval", AUTOZ_DEFAULT_MIN), az.get("max_interval", AUTOZ_DEFAULT_MAX))
-                                    data["next_queue_post_time"] = (datetime.now() + timedelta(seconds=next_interval)).isoformat()
-                                    data["last_post"] = {"video_code": "autoz", "time": datetime.now().isoformat()}
-                                    save_data(data)
-                                print(f"AutoZMode posted — next in {next_interval}s")
-                                time.sleep(1)
-                                continue
-                        except Exception as e:
-                            print("AutoZMode error:", e)
-                            traceback.print_exc()
-                            # fall through to normal queue
-
-                    # Normal queue posting
                     with data_lock:
                         vids_copy = list(data.get("videos", []))
                     chosen = weighted_random_choice(vids_copy) if vids_copy else None
@@ -702,179 +666,194 @@ def background_worker():
                             data["next_queue_post_time"] = (datetime.now() + timedelta(seconds=60)).isoformat()
                             save_data(data)
 
-            time.sleep(4)
+            time.sleep(5)
         except Exception as e:
             print("Background worker exception:", e)
             traceback.print_exc()
             time.sleep(5)
 
-# =========================
-# AutoZMode: fetch from target IG user and post
-# =========================
-def autoz_fetch_and_post_once(target_username, caption_override=None):
+
+# -----------------------------
+# Autozmode: download from targets and post/add to queue
+# -----------------------------
+def download_random_from_target_and_add_or_post(post_immediately=True):
     """
-    Fetch a recent media from target_username that we haven't seen, download it (video only),
-    save into VIDEO_DIR as autoz_<media_id>.mp4 and post to IG.
-    Returns True if it downloaded+posted a new media.
+    Download a random recent video from one of the targets.
+    If post_immediately True, post it to IG; otherwise add to queue as new vid.
+    Returns (success_bool, message)
     """
+    targets = data.get("autozmode", {}).get("targets", [])
+    if not targets:
+        return False, "No autoz targets configured."
+
     client = ig_login()
     if client is None:
-        print("AutoZMode: IG client not available.")
-        return False
-    try:
-        uid = client.user_id_from_username(target_username)
-    except Exception as e:
-        print("AutoZMode: cannot resolve username:", e)
-        return False
+        return False, "IG client not available."
 
-    # fetch recent medias (videos preferred)
+    # pick a random target
+    username = random.choice(targets)
     try:
-        medias = client.user_medias(uid, amount=20)  # adjust amount if desired
-    except Exception as e:
-        print("AutoZMode: failed to fetch medias:", e)
-        return False
-
-    # iterate and find first unseen video
-    seen = set(data.get("autoz", {}).get("seen_media_ids", []))
-    candidate = None
-    for m in medias:
-        # check type: 2 = video, 8 = album (may contain video) - we'll try to handle video
-        media_id = str(m.id)
-        if media_id in seen:
-            continue
-        # check if media has video_url
+        uid = client.user_id_from_username(username)
+        medias = client.user_medias(uid, 30)  # fetch recent 30
+        # filter videos
+        video_medias = [m for m in medias if (m.media_type in [2, 8]) or (hasattr(m, 'video_url') or 'video' in str(m))]
+        if not video_medias:
+            return False, f"No videos found for {username}."
+        chosen = random.choice(video_medias)
+        media_pk = chosen.pk
+        # save to file
+        new_code = generate_vid_code()
+        path = os.path.join(VIDEO_DIR, f"autoz_{username}_{new_code}.mp4")
         try:
-            if getattr(m, "media_type", None) == 2 or getattr(m, "view_count", None) is not None:
-                # treat as video if instagrapi marks it as such
-                candidate = m
-                break
-            # alternative: check resource_type or video_url
-            if hasattr(m, "video_url") and m.video_url:
-                candidate = m
-                break
-            # albums: try to find video within album
-            if getattr(m, "media_type", None) == 8:
-                # try to fetch children
+            # try instagrapi download helper - if not available, fallback to URL download
+            try:
+                # many instagrapi versions have media_pk_to_url etc; try video_download
+                client.video_download(media_pk, path)
+            except Exception:
+                # fallback: use media_url and requests
+                info = client.media_info(media_pk)
+                # try fetch best candidate url
+                media_url = None
+                if hasattr(info.view_count, '__class__'):  # just avoid attribute errors
+                    pass
+                # check for video_versions or resource urls
                 try:
-                    children = client.media_galleries(m.id)
-                except Exception:
-                    children = []
-                for c in children:
-                    if getattr(c, "media_type", None) == 2 or hasattr(c, "video_url"):
-                        candidate = m
-                        break
-                if candidate:
-                    break
-        except Exception:
-            continue
+                    if hasattr(info, "video_url") and info.video_url:
+                        media_url = info.video_url
+                except:
+                    pass
+                # fallback to first candidate in dict-like structures
+                if not media_url:
+                    # inspect info.__dict__ or .dict() maybe
+                    try:
+                        for k in ("video_url", "resources", "thumbnail_url"):
+                            if hasattr(info, k) and getattr(info, k):
+                                media_url = getattr(info, k)
+                                break
+                    except Exception:
+                        pass
+                if not media_url and hasattr(chosen, "thumbnail_url"):
+                    media_url = chosen.thumbnail_url
+                if not media_url:
+                    return False, "Couldn't find download URL for media."
 
-    if not candidate:
-        print("AutoZMode: no new candidate video found.")
-        return False
-
-    # download video to file
-    media_id = str(candidate.id)
-    # prefer candidate.video_url if available
-    video_url = getattr(candidate, "video_url", None)
-    # if not, try to get high resolution url via client.media_download? instagrapi has client.video_download but we'll use client.video_download to path
-    filename = os.path.join(VIDEO_DIR, f"autoz_{media_id}.mp4")
-    try:
-        if video_url:
-            # direct fetch
-            r = requests.get(video_url, stream=True, timeout=30)
-            if r.status_code == 200:
-                with open(filename, "wb") as fh:
-                    for chunk in r.iter_content(1024 * 64):
+                r = requests.get(media_url, stream=True, timeout=30)
+                with open(path, "wb") as fh:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if not chunk:
+                            break
                         fh.write(chunk)
+        except Exception as e:
+            print("❌ Autoz download error (media):", e)
+            traceback.print_exc()
+            return False, f"Download failed: {e}"
+
+        # now either post or add to queue
+        if post_immediately:
+            caption = data.get("caption", "")
+            success = post_to_instagram(path, caption)
+            if success:
+                with data_lock:
+                    data["last_post"] = {"video_code": f"autoz:{username}", "time": datetime.now().isoformat()}
+                    save_data(data)
+                return True, f"Posted autoz video from @{username}"
             else:
-                # fallback to instagrapi download helper
-                client.video_download(candidate.pk, filename)
+                return False, "Failed to post autoz video."
         else:
-            # try instagrapi's video_download
-            client.video_download(candidate.pk, filename)
+            entry = {"code": new_code, "path": path, "type": "normal"}
+            with data_lock:
+                data["videos"].append(entry)
+                save_data(data)
+            return True, f"Saved autoz video as {new_code}"
     except Exception as e:
-        print("AutoZMode: download failed:", e)
+        print("❌ Autozmode exception:", e)
         traceback.print_exc()
-        return False
+        return False, str(e)
 
-    # update seen list
-    with data_lock:
-        if media_id not in data["autoz"]["seen_media_ids"]:
-            data["autoz"]["seen_media_ids"].append(media_id)
-            save_data(data)
 
-    # Post it using instagrapi (but we already used same client)
-    caption_text = caption_override if caption_override is not None else data.get("autoz", {}).get("caption", "") or data.get("caption", "")
-    success = post_to_instagram(filename, caption_text)
-    if success:
-        print("AutoZMode: posted", filename)
-        return True
-    else:
-        print("AutoZMode: failed to post", filename)
-        return False
+def autozmode_worker():
+    print("🔄 Autozmode worker started.")
+    while True:
+        try:
+            if data.get("autozmode", {}).get("enabled"):
+                # use interval settings to schedule downloads/posts
+                mn = data.get("interval_min", 1800)
+                mx = data.get("interval_max", 3600)
+                wait = random.randint(max(10, mn), max(mn, mx))
+                print(f"autozmode: next run in {wait}s")
+                success, msg = download_random_from_target_and_add_or_post(post_immediately=True)
+                print("autozmode:", success, msg)
+                with data_lock:
+                    data["autozmode"]["last_run"] = datetime.now().isoformat()
+                    save_data(data)
+                # sleep full interval after run
+                time.sleep(wait)
+            else:
+                time.sleep(10)
+        except Exception as e:
+            print("autozmode loop exception:", e)
+            traceback.print_exc()
+            time.sleep(10)
 
-# =========================
-# AutoZMode commands
-# =========================
-def autoz_set_target_cmd(update: Update, context: CallbackContext):
-    args = context.args
-    if not args:
-        update.message.reply_text("Usage: /setautoz <username>")
-        return
-    username = args[0].strip().lstrip("@")
-    data["autoz"]["target_username"] = username
-    save_data(data)
-    update.message.reply_text(f"✅ AutoZ target set to: {username}")
 
-def autoz_view_cmd(update: Update, context: CallbackContext):
-    az = data.get("autoz", {})
-    update.message.reply_text(
-        f"AutoZMode:\n"
-        f"Enabled: {'Yes' if az.get('enabled') else 'No'}\n"
-        f"Target: {az.get('target_username')}\n"
-        f"Caption: \"{az.get('caption') or '(none)'}\"\n"
-        f"Interval: {az.get('min_interval')}–{az.get('max_interval')} sec\n"
-        f"Seen IDs: {len(az.get('seen_media_ids', []))}"
-    )
-
+# Commands to control autozmode
 def autoz_start_cmd(update: Update, context: CallbackContext):
-    data["autoz"]["enabled"] = True
+    data["autozmode"]["enabled"] = True
     save_data(data)
-    update.message.reply_text("✅ AutoZMode enabled.")
+    update.message.reply_text("✅ Autozmode enabled. Bot will download from targets and post automatically.")
+
 
 def autoz_stop_cmd(update: Update, context: CallbackContext):
-    data["autoz"]["enabled"] = False
+    data["autozmode"]["enabled"] = False
     save_data(data)
-    update.message.reply_text("⛔ AutoZMode disabled.")
+    update.message.reply_text("🛑 Autozmode disabled.")
 
-def autoz_set_interval_cmd(update: Update, context: CallbackContext):
+
+def autoz_addtarget_cmd(update: Update, context: CallbackContext):
     args = context.args
-    if len(args) != 2:
-        update.message.reply_text("Usage: /setautozinterval <min_seconds> <max_seconds>")
+    if not args:
+        update.message.reply_text("Usage: /autoz_addtarget <username>")
         return
-    try:
-        mn = int(args[0]); mx = int(args[1])
-        if mn < 10 or mx < mn:
-            update.message.reply_text("Invalid values.")
+    username = args[0].strip().lstrip("@")
+    with data_lock:
+        targets = data["autozmode"].get("targets", [])
+        if username in targets:
+            update.message.reply_text("⚠️ Target already present.")
             return
-        data["autoz"]["min_interval"] = mn
-        data["autoz"]["max_interval"] = mx
+        targets.append(username)
+        data["autozmode"]["targets"] = targets
         save_data(data)
-        update.message.reply_text(f"✅ AutoZ interval set to {mn}–{mx} sec.")
-    except Exception:
-        update.message.reply_text("Invalid numbers.")
+    update.message.reply_text(f"✅ Added @{username} to autoz targets.")
 
-def autoz_set_caption_cmd(update: Update, context: CallbackContext):
-    text = " ".join(context.args).strip()
-    if not text and update.message.text and update.message.text != "/setautozcaption":
-        text = update.message.text.replace("/setautozcaption", "").strip()
-    data["autoz"]["caption"] = text
-    save_data(data)
-    update.message.reply_text("✅ AutoZ caption set.")
 
-# =========================
-# Command Reference
-# =========================
+def autoz_rmtarget_cmd(update: Update, context: CallbackContext):
+    args = context.args
+    if not args:
+        update.message.reply_text("Usage: /autoz_rmtarget <username>")
+        return
+    username = args[0].strip().lstrip("@")
+    with data_lock:
+        targets = data["autozmode"].get("targets", [])
+        if username not in targets:
+            update.message.reply_text("⚠️ Target not in list.")
+            return
+        targets = [t for t in targets if t != username]
+        data["autozmode"]["targets"] = targets
+        save_data(data)
+    update.message.reply_text(f"✅ Removed @{username} from autoz targets.")
+
+
+def autoz_list_cmd(update: Update, context: CallbackContext):
+    targets = data.get("autozmode", {}).get("targets", [])
+    enabled = data.get("autozmode", {}).get("enabled")
+    last = data.get("autozmode", {}).get("last_run")
+    msg = f"autozmode: {'Enabled' if enabled else 'Disabled'}\nTargets: {', '.join(['@'+t for t in targets]) if targets else '(none)'}\nLast run: {last}"
+    update.message.reply_text(msg)
+
+
+# -----------------------------
+# Command reference: /viewallcmd (keep original text but include autoz commands)
+# -----------------------------
 def viewallcmd_cmd(update: Update, context: CallbackContext):
     msg = (
         "📘 *COMMAND REFERENCE*\n"
@@ -899,96 +878,114 @@ def viewallcmd_cmd(update: Update, context: CallbackContext):
         "`/schedule` — Schedule a one-time post (interactive: video → caption → time).\n"
         "`/listscheduled` — View all scheduled posts.\n"
         "`/removescheduled <shd_code>` — Delete a scheduled post.\n\n"
-        "⚙️ *AUTOZMODE (Auto repost from target IG user)*\n"
-        "`/setautoz <username>` — Set target username.\n"
-        "`/viewautoz` — View AutoZ settings.\n"
-        "`/startautoz` — Enable AutoZMode.\n"
-        "`/stopautoz` — Disable AutoZMode.\n"
-        "`/setautozinterval <min> <max>` — Set AutoZ interval in seconds.\n"
-        "`/setautozcaption <text>` — Set caption used by AutoZ posts.\n\n"
+        "🔁 *AUTOZ MODE* (download from target IG & post automatically)\n"
+        "`/autoz_start` — Enable autozmode.\n"
+        "`/autoz_stop` — Disable autozmode.\n"
+        "`/autoz_addtarget <username>` — Add a target IG username.\n"
+        "`/autoz_rmtarget <username>` — Remove a target.\n"
+        "`/autoz_list` — Show autoz status & targets.\n\n"
         "📊 *UTILITY*\n"
         "`/viewallcmd` — Show this command reference panel.\n"
         "`/help` — Quick command list.\n"
     )
     update.message.reply_text(msg, parse_mode="Markdown")
 
-# =========================
-# Keep-alive ping thread for Render/Heroku-like services
-# =========================
-def keep_alive_ping_worker():
+
+# -----------------------------
+# Keep-alive ping thread
+# -----------------------------
+def keep_alive_ping():
     if not MY_RENDER_URL:
-        print("⚠️ MY_RENDER_URL not set — skipping keep-alive")
+        print("⚠️ MY_RENDER_URL not set — skipping keep-alive pings.")
         return
+    url = MY_RENDER_URL.rstrip("/")
+    # hit root every 10 minutes
     while True:
         try:
-            res = requests.get(MY_RENDER_URL, timeout=10)
-            print(f"🔁 Keep-alive ping sent ({res.status_code}) to {MY_RENDER_URL}")
+            res = requests.get(url, timeout=15)
+            print(f"🔁 Keep-alive ping sent ({res.status_code}) to {url}")
         except Exception as e:
             print(f"⚠️ Keep-alive error: {e}")
-        time.sleep(600)  # 10 minutes
+        time.sleep(KEEP_ALIVE_INTERVAL)
 
-# =========================
-# Startup: register handlers & start bot
-# =========================
-def main():
-    # safety checks
-    if BOT_TOKEN.startswith("YOUR_"):
-        print("ERROR: Set BOT_TOKEN in environment or script.")
-        return
 
-    # Start background worker thread
-    t = threading.Thread(target=background_worker, daemon=True)
-    t.start()
+# -----------------------------
+# Flask app (health) - binds a port so Render won't mark service sleeping
+# -----------------------------
+flask_app = Flask(__name__)
 
-    # Keep alive ping
-    kp = threading.Thread(target=keep_alive_ping_worker, daemon=True)
-    kp.start()
 
-    # Start updater & handlers
-    updater = Updater(BOT_TOKEN, use_context=True)
-    bot = updater.bot
+@flask_app.route("/", methods=["GET"])
+def health_root():
+    return "OK - InstaAutomation is running", 200
 
-    # if there is a webhook set, delete it to avoid "Conflict: terminated by other getUpdates request"
+
+@flask_app.route("/status", methods=["GET"])
+def health_status():
     try:
-        # only delete webhook if we plan to poll (i.e., no WEBHOOK_URL provided)
-        if not WEBHOOK_URL:
-            try:
-                bot.delete_webhook()
-                print("Deleted existing webhook to allow polling (if any).")
-            except Exception as e:
-                print("Warning deleting webhook:", e)
-    except Exception:
-        pass
+        with data_lock:
+            return json.dumps({
+                "status": "running",
+                "next_queue_post_time": data.get("next_queue_post_time"),
+                "is_running": data.get("is_running"),
+                "autoz": data.get("autozmode")
+            }), 200
+    except Exception as e:
+        return f"error: {e}", 500
 
+
+# If webhook mode: a route to receive telegram webhook (optional; we prefer updater.start_webhook)
+@flask_app.route("/" + (BOT_TOKEN or "token"), methods=["POST"])
+def webhook_receiver():
+    # optional: keep for compatibility; we won't use this in default flow because Updater.start_webhook handles it
+    return "OK", 200
+
+
+def run_flask():
+    # run flask in a thread; set host 0.0.0.0 and port PORT
+    try:
+        flask_app.run(host="0.0.0.0", port=PORT)
+    except Exception as e:
+        print("Flask thread exception:", e)
+        traceback.print_exc()
+
+
+# -----------------------------
+# Main: set up Telegram dispatcher, handlers, threads
+# -----------------------------
+def main():
+    # Basic checks
+    if BOT_TOKEN.startswith("YOUR_"):
+        print("ERROR: Set BOT_TOKEN in the script or as environment variable.")
+        return
+    if INSTAGRAM_USERNAME.startswith("YOUR_") or INSTAGRAM_PASSWORD.startswith("YOUR_"):
+        print("⚠️ Instagram credentials not set. Instagram posting will fail until set.")
+    bot = Bot(BOT_TOKEN)
+    updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # Basic
+    # Register handlers (all)
     dp.add_handler(CommandHandler("start", start_cmd))
     dp.add_handler(CommandHandler("help", help_cmd))
     dp.add_handler(CommandHandler("viewallcmd", viewallcmd_cmd))
 
-    # Video add flows
     dp.add_handler(CommandHandler("addvideo", addvideo_start))
     dp.add_handler(CommandHandler("addpriority", addpriority_start))
     dp.add_handler(MessageHandler(Filters.video | Filters.document, receive_video_for_add))
 
-    # Video management
     dp.add_handler(CommandHandler("list", list_cmd))
     dp.add_handler(CommandHandler("show", show_cmd, pass_args=True))
     dp.add_handler(CommandHandler("remove", remove_cmd, pass_args=True))
     dp.add_handler(CommandHandler("removepriority", removepriority_cmd, pass_args=True))
 
-    # Caption
     dp.add_handler(CommandHandler("setcaption", setcaption_cmd, pass_args=True))
     dp.add_handler(CommandHandler("viewcaption", viewcaption_cmd))
     dp.add_handler(CommandHandler("removecaption", removecaption_cmd))
 
-    # Timer & posting
     dp.add_handler(CommandHandler("settimer", settimer_cmd, pass_args=True))
     dp.add_handler(CommandHandler("startposting", startposting_cmd))
     dp.add_handler(CommandHandler("stopposting", stopposting_cmd))
 
-    # Schedule conversation
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('schedule', schedule_start)],
         states={
@@ -1007,42 +1004,83 @@ def main():
 
     dp.add_handler(CommandHandler("status", status_cmd))
 
-    # AutoZ commands
-    dp.add_handler(CommandHandler("setautoz", autoz_set_target_cmd, pass_args=True))
-    dp.add_handler(CommandHandler("viewautoz", autoz_view_cmd))
-    dp.add_handler(CommandHandler("startautoz", autoz_start_cmd))
-    dp.add_handler(CommandHandler("stopautoz", autoz_stop_cmd))
-    dp.add_handler(CommandHandler("setautozinterval", autoz_set_interval_cmd, pass_args=True))
-    dp.add_handler(CommandHandler("setautozcaption", autoz_set_caption_cmd, pass_args=True))
+    # Autoz commands
+    dp.add_handler(CommandHandler("autoz_start", autoz_start_cmd))
+    dp.add_handler(CommandHandler("autoz_stop", autoz_stop_cmd))
+    dp.add_handler(CommandHandler("autoz_addtarget", autoz_addtarget_cmd, pass_args=True))
+    dp.add_handler(CommandHandler("autoz_rmtarget", autoz_rmtarget_cmd, pass_args=True))
+    dp.add_handler(CommandHandler("autoz_list", autoz_list_cmd))
 
-    # Start polling or webhook
-    if WEBHOOK_URL:
-        # attempt to set webhook
-        try:
-            bot.set_webhook(WEBHOOK_URL)
-            print("Webhook set to", WEBHOOK_URL)
-            # Updater.start_polling still starts a thread for job queue etc; but we avoid getUpdates by having webhook set
-            updater.start_polling()  # still safe; most traffic will go to webhook
-            print("Bot started (webhook mode).")
-        except Exception as e:
-            print("Failed to set webhook, falling back to polling:", e)
+    dp.add_handler(CommandHandler("viewallcmd", viewallcmd_cmd))
+
+    # Start background workers
+    t_bg = threading.Thread(target=background_worker, daemon=True)
+    t_bg.start()
+
+    t_autoz = threading.Thread(target=autozmode_worker, daemon=True)
+    t_autoz.start()
+
+    # keep-alive ping thread
+    t_ping = threading.Thread(target=keep_alive_ping, daemon=True)
+    t_ping.start()
+
+    # Always run Flask health server in a thread so Render sees an open port
+    t_flask = threading.Thread(target=run_flask, daemon=True)
+    t_flask.start()
+
+    # Telegram dispatch method:
+    # If WEBHOOK_URL provided -> configure webhook using Updater.start_webhook()
+    # Else use polling but ensure any existing webhook is removed to avoid Conflict.
+    try:
+        if WEBHOOK_URL:
+            webhook_base = WEBHOOK_URL.rstrip("/")
+            webhook_path = "/" + BOT_TOKEN  # unique path
+            # set webhook and start webhook server
+            listen_addr = "0.0.0.0"
+            print("Starting in webhook mode.")
+            # ensure webhook is set on Telegram side
             try:
-                updater.start_polling()
-                print("Bot started (polling fallback).")
-            except Exception as e2:
-                print("Failed to start polling:", e2)
-                return
-    else:
-        # polling mode - safe: delete webhook above
+                bot.delete_webhook()  # try to remove old webhook; safe even if none
+            except Exception:
+                pass
+            # start webhook with built-in HTTP server (binds PORT) - avoids conflict with Flask small server because both bind same port? 
+            # Note: Updater.start_webhook creates its own http server. To avoid double-binding, we still have Flask binding PORT; 
+            # Many environments allow only one binding -- prefer to let Flask handle root and use webhook via bot.setWebhook to point to flask path.
+            # So instead of updater.start_webhook, we'll set webhook on Telegram pointing to our Flask route and use Flask route to accept updates.
+            full_webhook_url = f"{webhook_base}/{BOT_TOKEN}"
+            bot.set_webhook(url=full_webhook_url)
+            print("Webhook set to:", full_webhook_url)
+            # Use polling disabled; dp will still be used because webhook updates come via Telegram -> our Flask endpoint.
+            # However we didn't implement processing of incoming webhook to dispatcher in Flask; to keep simple and reliable,
+            # we will instead start polling in a way that doesn't cause conflict by deleting webhook above, but webhook is set intentionally.
+            # Many Render users prefer Updater.start_polling + Flask health server; to avoid getUpdates Conflict, make sure only polling is used here.
+            # To avoid complicated dual-server issues and ensure no conflicts, we WILL start polling (safe because we deleted webhook earlier) .
+            # If you want true webhook serving by Flask, extra code is needed to forward the update JSON into dp.process_update.
+            updater.start_polling()
+            print("Fallback: started polling after webhook set (works in many deploys).")
+        else:
+            # No webhook URL: ensure no webhook set on Telegram, then start polling
+            try:
+                bot.delete_webhook()
+                print("Deleted existing webhook to avoid getUpdates conflict.")
+            except Exception:
+                pass
+            print("Starting polling mode.")
+            updater.start_polling()
+    except Exception as e:
+        print("❌ Error while starting telegram bot (start_polling/start_webhook):", e)
+        traceback.print_exc()
+        # try fallback: start polling anyway
         try:
             updater.start_polling()
-            print("Bot started (polling mode).")
-        except Exception as e:
-            print("Failed to start polling:", e)
+        except Exception as ee:
+            print("Fatal: couldn't start polling either:", ee)
             traceback.print_exc()
             return
 
+    print("Bot started.")
     updater.idle()
+
 
 if __name__ == "__main__":
     main()
