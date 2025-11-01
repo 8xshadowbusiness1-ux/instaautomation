@@ -1,348 +1,218 @@
-#!/usr/bin/env python3
-"""
-insta_autoz_final.py
-AutozMode Only - Final Version
-- Auto download & post random videos from target IG accounts
-- Interval control via /setinterval
-- Status, Target management, Buttons
-- Safe background threads, 5min keep-alive ping
-"""
-
-import os, json, threading, time, random, traceback, requests
-from datetime import datetime
-from functools import wraps
-from flask import Flask, request
+import os
+import time
+import random
+import threading
+import requests
+from flask import Flask
 from instagrapi import Client
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import Conflict as TgConflict
-from telegram.ext import (
-    Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackContext, CallbackQueryHandler
 
-# === CONFIG ===
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
-IG_USER = os.getenv("INSTAGRAM_USERNAME", "YOUR_IG_USERNAME")
-IG_PASS = os.getenv("INSTAGRAM_PASSWORD", "YOUR_IG_PASSWORD")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0) or None
-MY_RENDER_URL = os.getenv("MY_RENDER_URL")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", 10000))
-KEEP_ALIVE_INTERVAL = 300  # 5 min
-
-DATA_FILE = "autoz_data.json"
+# ==========================
+# CONFIGURATION
+# ==========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+INSTAGRAM_USERNAME = os.getenv("IG_USERNAME", "your_ig_username")
+INSTAGRAM_PASSWORD = os.getenv("IG_PASSWORD", "your_ig_password")
+MY_RENDER_URL = os.getenv("MY_RENDER_URL", "https://yourapp.onrender.com")
 VIDEO_DIR = "videos"
-os.makedirs(VIDEO_DIR, exist_ok=True)
+AUTOZ_INTERVAL = int(os.getenv("AUTOZ_INTERVAL", "900"))  # default 15 min
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))  # optional
 
-DEFAULT = {
-    "autoz": {"enabled": False, "targets": [], "interval_min": 1800, "interval_max": 3600, "last_run": None},
-    "last_post": {"video_code": None, "time": None}
+app = Flask(__name__)
+bot_status = {
+    "videos_posted": 0,
+    "last_post_time": None,
+    "next_post_in": AUTOZ_INTERVAL,
+    "last_error": None,
+    "ping_interval": 600,
+    "last_ping": None,
+    "is_running": False
 }
-data_lock = threading.Lock()
 
-# === UTILS ===
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        save_data(DEFAULT)
-        return DEFAULT.copy()
-    try:
-        d = json.load(open(DATA_FILE))
-    except Exception:
-        d = DEFAULT.copy()
-    for k,v in DEFAULT.items():
-        if k not in d: d[k]=v
-    return d
+# ==========================
+# KEEP ALIVE PING THREAD
+# ==========================
+def keep_alive_ping():
+    while True:
+        try:
+            res = requests.get(MY_RENDER_URL)
+            bot_status["last_ping"] = time.strftime("%H:%M:%S")
+            print(f"🔁 Keep-alive ping sent ({res.status_code}) to {MY_RENDER_URL}")
+        except Exception as e:
+            bot_status["last_error"] = f"Ping Error: {e}"
+            print(f"⚠️ Keep-alive error: {e}")
+        time.sleep(bot_status["ping_interval"])  # default every 10 min
 
-def save_data(d=None):
-    with data_lock:
-        json.dump(d or data, open(DATA_FILE,"w"), indent=2, default=str)
+threading.Thread(target=keep_alive_ping, daemon=True).start()
 
-data = load_data()
-ig_client=None
-
-# === IG LOGIN ===
+# ==========================
+# LOGIN FUNCTION
+# ==========================
 def ig_login():
-    global ig_client
-    if ig_client: return ig_client
-    c=Client()
+    cl = Client()
     try:
-        c.login(IG_USER, IG_PASS)
-        ig_client=c; print("✅ IG Logged In")
-        return c
+        cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+        print("✅ Logged in to Instagram")
+        return cl
     except Exception as e:
-        print("❌ IG login failed:", e)
-        traceback.print_exc()
+        bot_status["last_error"] = f"IG Login Error: {e}"
+        print(f"⚠️ Instagram login failed: {e}")
         return None
 
-# === HELPERS ===
-def admin_only(f):
-    @wraps(f)
-    def w(u,c,*a,**k):
-        if ADMIN_CHAT_ID and u.effective_user.id!=ADMIN_CHAT_ID:
-            u.message.reply_text("❌ Not authorized")
-            return
-        return f(u,c,*a,**k)
-    return w
-
-def safe_thread(fn):
-    @wraps(fn)
-    def wrap(u,c,*a,**k):
-        threading.Thread(target=lambda: _safe_run(fn,u,c,*a,**k),daemon=True).start()
-    return wrap
-def _safe_run(fn,u,c,*a,**k):
-    try: fn(u,c,*a,**k)
-    except Exception as e: traceback.print_exc()
-
-# === CORE AUTOZ ===
-# ✅ Safe wrapper to handle Instagram JSONDecodeError gracefully
-def safe_user_medias(cl, username, amount=20):
-    try:
-        uid = cl.user_id_from_username(username)
-        medias = cl.user_medias(uid, amount)
-        return medias
-    except Exception as e:
-        print(f"[⚠️] Failed to fetch medias for {username}: {e}")
-        return []
-
+# ==========================
+# DOWNLOAD RANDOM VIDEO
+# ==========================
 def download_random_video(username):
     cl = ig_login()
     if not cl:
         return False, "Login failed"
     try:
-        # Fetch user ID and videos using private API (safer)
+        # Use private API (v1) to fetch user media safely
         uid = cl.user_id_from_username(username)
         medias = cl.user_medias_v1(uid, amount=30)
     except Exception as e:
         print(f"[⚠️] user_medias_v1 failed for {username}: {e}")
         medias = []
 
-        vids = [m for m in medias if getattr(m, "video_url", None)]
-        if not vids:
-            return False, "No videos found"
+    vids = [m for m in medias if getattr(m, "video_url", None)]
+    if not vids:
+        return False, "No videos found"
 
-        # Random video select
-        ch = random.choice(vids)
+    ch = random.choice(vids)
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+    video_path = cl.video_download(ch.pk, folder=VIDEO_DIR)
+    return True, video_path
 
-        # Ensure videos directory exists
-        os.makedirs(VIDEO_DIR, exist_ok=True)
+# ==========================
+# AUTOZ WORKER
+# ==========================
+AUTOZ_TARGET = None
+AUTOZ_RUNNING = False
 
-        # ✅ Correct call — give only folder name, not file path
-        video_path = cl.video_download(ch.pk, folder=VIDEO_DIR)
-
-        return True, video_path
-    except Exception as e:
-        traceback.print_exc()
-        return False, str(e)
-        
-def post_to_ig(path):
-    cl=ig_login()
-    if not cl: return False,"Login fail"
-    try:
-        cl.video_upload(path,"")
-        print("✅ Posted:",path)
-        return True,"ok"
-    except Exception as e:
-        traceback.print_exc()
-        return False,str(e)
-
-def autoz_cycle():
-    tgs=data["autoz"]["targets"]
-    if not tgs: return False,"No targets"
-    u=random.choice(tgs)
-    ok,p=download_random_video(u)
-    if not ok: return False,p
-    ok2,m=post_to_ig(p)
-    with data_lock:
-        data["last_post"]={"video_code":f"autoz:{u}","time":datetime.now().isoformat()}
-        data["autoz"]["last_run"]=datetime.now().isoformat()
-        save_data(data)
-    return ok2,f"Posted from @{u}"
-
-# === WORKERS ===
 def autoz_worker():
-    print("🔄 Autoz Worker Started")
-    while True:
+    global AUTOZ_RUNNING
+    AUTOZ_RUNNING = True
+    bot_status["is_running"] = True
+    while AUTOZ_RUNNING:
         try:
-            if data["autoz"]["enabled"]:
-                mn=data["autoz"]["interval_min"]; mx=data["autoz"]["interval_max"]
-                w=random.randint(mn,mx)
-                print(f"Next autoz in {w}s")
-                ok,m=autoz_cycle()
-                print("Autoz Result:",ok,m)
-                for _ in range(0,w,5):
-                    if not data["autoz"]["enabled"]: break
-                    time.sleep(5)
+            if AUTOZ_TARGET:
+                ok, msg = download_random_video(AUTOZ_TARGET)
+                if ok:
+                    print(f"✅ Downloaded and posting: {msg}")
+                    cl = ig_login()
+                    if cl:
+                        cl.clip_upload(msg, caption=f"Autoz repost from @{AUTOZ_TARGET}")
+                        bot_status["videos_posted"] += 1
+                        bot_status["last_post_time"] = time.strftime("%H:%M:%S")
+                        bot_status["last_error"] = None
+                        print("📤 Posted to Instagram")
+                else:
+                    bot_status["last_error"] = msg
+                    print(f"⚠️ {msg}")
             else:
-                time.sleep(5)
+                print("⚠️ No target set for autozmode.")
+            time.sleep(bot_status["next_post_in"])
         except Exception as e:
-            traceback.print_exc(); time.sleep(5)
+            bot_status["last_error"] = str(e)
+            print(f"❌ Autoz error: {e}")
+            time.sleep(600)  # wait 10 min before retry
+    bot_status["is_running"] = False
 
-def keep_alive():
-    if not MY_RENDER_URL: return
-    url=MY_RENDER_URL.rstrip("/")
-    while True:
-        try:
-            r=requests.get(url,timeout=15)
-            print(f"Ping {r.status_code} {url}")
-        except Exception as e: print("Ping err",e)
-        time.sleep(KEEP_ALIVE_INTERVAL)
+# ==========================
+# TELEGRAM BOT COMMANDS
+# ==========================
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "🤖 *InstaAutomation Bot is Active!*\n"
+        "Commands:\n"
+        "/settarget <username> — Set target Instagram\n"
+        "/start_auto — Start auto repost\n"
+        "/stop_auto — Stop auto repost\n"
+        "/setinterval <seconds> — Change posting interval\n"
+        "/status — Show current bot status\n"
+        "/ping — Check ping status\n",
+        parse_mode="Markdown"
+    )
 
-# === FLASK ===
-app=Flask(__name__)
-dp=None; bot=None
-@app.route("/")
-def root(): return "OK Autoz Bot",200
-@app.route("/status")
-def status(): return json.dumps(data),200
-@app.route("/"+BOT_TOKEN,methods=["POST"])
-def wh(): 
-    from telegram import Update
-    upd=Update.de_json(request.get_json(force=True),bot)
-    dp.process_update(upd); return "ok",200
+def settarget(update: Update, context: CallbackContext):
+    global AUTOZ_TARGET
+    if len(context.args) == 0:
+        update.message.reply_text("⚠️ Usage: /settarget <username>")
+        return
+    AUTOZ_TARGET = context.args[0]
+    update.message.reply_text(f"🎯 Target set to: {AUTOZ_TARGET}")
 
-def run_flask(): app.run(host="0.0.0.0",port=PORT,threaded=True)
+def start_auto(update: Update, context: CallbackContext):
+    if not AUTOZ_TARGET:
+        update.message.reply_text("⚠️ Set a target first using /settarget <username>")
+        return
+    threading.Thread(target=autoz_worker, daemon=True).start()
+    update.message.reply_text("🚀 Autoz Mode Started!")
 
-# === TELEGRAM HANDLERS ===
-def menu_btns():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶ Start",callback_data="start_auto"),
-         InlineKeyboardButton("⏹ Stop",callback_data="stop_auto")],
-        [InlineKeyboardButton("➕ Add Target",callback_data="add_target"),
-         InlineKeyboardButton("➖ Remove Target",callback_data="rm_target")],
-        [InlineKeyboardButton("📋 List",callback_data="list_target"),
-         InlineKeyboardButton("⚙️ Set Interval",callback_data="interval_help")],
-        [InlineKeyboardButton("🧾 Status",callback_data="status"),
-         InlineKeyboardButton("🔁 Manual Run",callback_data="manual_run")],
-        [InlineKeyboardButton("📡 Ping",callback_data="ping_now"),
-         InlineKeyboardButton("❓ Help",callback_data="help")]
-    ])
+def stop_auto(update: Update, context: CallbackContext):
+    global AUTOZ_RUNNING
+    AUTOZ_RUNNING = False
+    update.message.reply_text("🛑 Autoz Mode Stopped!")
 
-def start_cmd(u,c): u.message.reply_text("🚀 Autoz Bot Ready!",reply_markup=menu_btns())
-def help_cmd(u,c): u.message.reply_text("Commands:\n/autoz_start\n/autoz_stop\n/autoz_addtarget <user>\n/autoz_rmtarget <user>\n/autoz_list\n/setinterval <min> <max>\n/autoz_manual\n/autoz_status\n/menu")
-
-def menu_cmd(u,c): start_cmd(u,c)
-
-@admin_only
-def autoz_start(u,c):
-    data["autoz"]["enabled"]=True; save_data(data)
-    u.message.reply_text("✅ Autoz started")
-
-@admin_only
-def autoz_stop(u,c):
-    data["autoz"]["enabled"]=False; save_data(data)
-    u.message.reply_text("🛑 Autoz stopped")
-
-@admin_only
-def add_target(u,c):
-    a=c.args
-    if not a: u.message.reply_text("Usage: /autoz_addtarget <username>"); return
-    t=a[0].lstrip("@")
-    if t in data["autoz"]["targets"]: u.message.reply_text("Already added"); return
-    data["autoz"]["targets"].append(t); save_data(data)
-    u.message.reply_text(f"Added @{t}")
-
-@admin_only
-def rm_target(u,c):
-    a=c.args
-    if not a: u.message.reply_text("Usage: /autoz_rmtarget <username>"); return
-    t=a[0].lstrip("@")
-    if t not in data["autoz"]["targets"]: u.message.reply_text("Not found"); return
-    data["autoz"]["targets"]=[x for x in data["autoz"]["targets"] if x!=t]; save_data(data)
-    u.message.reply_text(f"Removed @{t}")
-
-def list_targets(u,c):
-    t=data["autoz"]["targets"]
-    u.message.reply_text("Targets:\n"+("\n".join(["@"+x for x in t]) if t else "(none)"))
-
-@safe_thread
-def manual_run(u,c):
-    chat=u.effective_chat.id
-    Bot(BOT_TOKEN).send_message(chat_id=chat,text="Manual run started...")
-    ok,m=autoz_cycle()
-    Bot(BOT_TOKEN).send_message(chat_id=chat,text=f"Result: {ok} {m}")
-
-def setinterval(u,c):
-    a=c.args
-    if len(a)!=2:
-        u.message.reply_text("Usage: /setinterval <min_seconds> <max_seconds>"); return
+def setinterval(update: Update, context: CallbackContext):
+    if len(context.args) == 0:
+        update.message.reply_text("⚠️ Usage: /setinterval <seconds>")
+        return
     try:
-        mn=int(a[0]); mx=int(a[1])
-        if mn<10 or mx<mn: u.message.reply_text("Keep min>=10 and max>=min"); return
-        data["autoz"]["interval_min"]=mn; data["autoz"]["interval_max"]=mx; save_data(data)
-        u.message.reply_text(f"Interval set: {mn}-{mx}s ✅")
-    except: u.message.reply_text("Invalid numbers")
+        sec = int(context.args[0])
+        bot_status["next_post_in"] = sec
+        update.message.reply_text(f"⏱ Interval set to {sec} seconds.")
+    except:
+        update.message.reply_text("⚠️ Invalid input.")
 
-def status_cmd(u,c):
-    a=data["autoz"]; last=data["last_post"]
-    txt=(f"📊 *AUTOZ STATUS*\n"
-         f"Enabled: {a['enabled']}\n"
-         f"Targets: {', '.join(a['targets']) or '(none)'}\n"
-         f"Interval: {a['interval_min']}–{a['interval_max']}s\n"
-         f"Last Run: {a['last_run']}\n"
-         f"Last Post: {last}")
-    u.message.reply_text(txt,parse_mode="Markdown")
+def status(update: Update, context: CallbackContext):
+    msg = (
+        "📊 *Bot Status:*\n"
+        f"🏃 Running: {'✅ Yes' if bot_status['is_running'] else '❌ No'}\n"
+        f"🎯 Target: {AUTOZ_TARGET or 'Not set'}\n"
+        f"📹 Videos Posted: {bot_status['videos_posted']}\n"
+        f"🕒 Last Post: {bot_status['last_post_time'] or 'N/A'}\n"
+        f"⏳ Next Post In: {bot_status['next_post_in']} sec\n"
+        f"📡 Last Ping: {bot_status['last_ping'] or 'N/A'}\n"
+        f"💥 Last Error: {bot_status['last_error'] or 'None'}\n"
+        f"🔁 Ping Interval: {bot_status['ping_interval']} sec\n"
+    )
+    update.message.reply_text(msg, parse_mode="Markdown")
 
-def ping_now(u,c):
-    if not MY_RENDER_URL: u.message.reply_text("MY_RENDER_URL not set"); return
+def ping(update: Update, context: CallbackContext):
     try:
-        r=requests.get(MY_RENDER_URL.rstrip("/"),timeout=10)
-        u.message.reply_text(f"Ping {r.status_code} OK")
-    except Exception as e: u.message.reply_text(str(e))
+        res = requests.get(MY_RENDER_URL)
+        update.message.reply_text(f"✅ Ping OK ({res.status_code})")
+    except Exception as e:
+        update.message.reply_text(f"⚠️ Ping failed: {e}")
 
-def cb(u,c):
-    q=u.callback_query; d=q.data
-    if d=="start_auto": autoz_start(q,c)
-    elif d=="stop_auto": autoz_stop(q,c)
-    elif d=="list_target": list_targets(q,c)
-    elif d=="status": status_cmd(q,c)
-    elif d=="manual_run": manual_run(q,c)
-    elif d=="ping_now": ping_now(q,c)
-    elif d=="interval_help": q.message.reply_text("Use /setinterval <min> <max>")
-    elif d=="add_target": q.message.reply_text("Use /autoz_addtarget <username>")
-    elif d=="rm_target": q.message.reply_text("Use /autoz_rmtarget <username>")
-    elif d=="help": help_cmd(q,c)
-    q.answer()
+# ==========================
+# TELEGRAM BOT RUNNER
+# ==========================
+def run_bot():
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("settarget", settarget))
+    dp.add_handler(CommandHandler("start_auto", start_auto))
+    dp.add_handler(CommandHandler("stop_auto", stop_auto))
+    dp.add_handler(CommandHandler("setinterval", setinterval))
+    dp.add_handler(CommandHandler("status", status))
+    dp.add_handler(CommandHandler("ping", ping))
+    print("🤖 Telegram Bot Started")
+    updater.start_polling()
+    updater.idle()
 
-# === MAIN ===
-def main():
-    global dp,bot
-    if BOT_TOKEN.startswith("YOUR_"): print("⚠️ Set BOT_TOKEN"); return
-    bot=Bot(BOT_TOKEN)
-    up=Updater(BOT_TOKEN,use_context=True)
-    dp=up.dispatcher
+threading.Thread(target=run_bot, daemon=True).start()
 
-    dp.add_handler(CommandHandler("start",start_cmd))
-    dp.add_handler(CommandHandler("help",help_cmd))
-    dp.add_handler(CommandHandler("menu",menu_cmd))
-    dp.add_handler(CommandHandler("autoz_start",autoz_start))
-    dp.add_handler(CommandHandler("autoz_stop",autoz_stop))
-    dp.add_handler(CommandHandler("autoz_addtarget",add_target,pass_args=True))
-    dp.add_handler(CommandHandler("autoz_rmtarget",rm_target,pass_args=True))
-    dp.add_handler(CommandHandler("autoz_list",list_targets))
-    dp.add_handler(CommandHandler("autoz_manual",manual_run))
-    dp.add_handler(CommandHandler("setinterval",setinterval,pass_args=True))
-    dp.add_handler(CommandHandler("autoz_status",status_cmd))
-    dp.add_handler(CommandHandler("ping_now",ping_now))
-    dp.add_handler(CallbackQueryHandler(cb))
+# ==========================
+# FLASK KEEP-ALIVE
+# ==========================
+@app.route('/')
+def home():
+    return "✅ InstaAutomation is Live!"
 
-    threading.Thread(target=autoz_worker,daemon=True).start()
-    threading.Thread(target=keep_alive,daemon=True).start()
-    threading.Thread(target=run_flask,daemon=True).start()
-
-    for i in range(3):
-        try:
-            bot.delete_webhook()
-            up.start_polling(); print("Bot Running ✅"); up.idle(); break
-        except TgConflict:
-            print("Conflict, retrying..."); bot.delete_webhook(); time.sleep(2)
-        except Exception as e:
-            traceback.print_exc(); time.sleep(2)
-
-if __name__=="__main__": main()
-
-
-
-
-
-
-
-
+if __name__ == '__main__':
+    print("🚀 InstaAutomation Booting...")
+    app.run(host='0.0.0.0', port=10000)
