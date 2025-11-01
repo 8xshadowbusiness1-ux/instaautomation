@@ -93,13 +93,22 @@ def _safe_run(fn,u,c,*a,**k):
     except Exception as e: traceback.print_exc()
 
 # === CORE AUTOZ ===
+# ✅ Safe wrapper to handle Instagram JSONDecodeError gracefully
+def safe_user_medias(cl, username, amount=20):
+    try:
+        uid = cl.user_id_from_username(username)
+        medias = cl.user_medias(uid, amount)
+        return medias
+    except Exception as e:
+        print(f"[⚠️] Failed to fetch medias for {username}: {e}")
+        return []
+
 def download_random_video(username):
     cl = ig_login()
     if not cl:
         return False, "Login failed"
     try:
-        uid = cl.user_id_from_username(username)
-        medias = cl.user_medias(uid, 30)
+        medias = safe_user_medias(cl, username, 30)
         vids = [m for m in medias if getattr(m, "video_url", None)]
         if not vids:
             return False, "No videos found"
@@ -323,6 +332,7 @@ def main():
             traceback.print_exc(); time.sleep(2)
 
 if __name__=="__main__": main()
+
 
 
 
