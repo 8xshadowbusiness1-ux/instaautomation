@@ -108,7 +108,13 @@ def download_random_video(username):
     if not cl:
         return False, "Login failed"
     try:
-        medias = safe_user_medias(cl, username, 30)
+        try:
+    uid = cl.user_id_from_username(username)
+    medias = cl.user_medias_v1(uid, amount=30)
+except Exception as e:
+    print(f"[⚠️] user_medias_v1 failed for {username}: {e}")
+    medias = []
+
         vids = [m for m in medias if getattr(m, "video_url", None)]
         if not vids:
             return False, "No videos found"
@@ -332,6 +338,7 @@ def main():
             traceback.print_exc(); time.sleep(2)
 
 if __name__=="__main__": main()
+
 
 
 
