@@ -103,17 +103,17 @@ def download_random_video(username):
         vids = [m for m in medias if getattr(m, "video_url", None)]
         if not vids:
             return False, "No videos found"
+
+        # Random video select
         ch = random.choice(vids)
 
+        # Ensure videos directory exists
         os.makedirs(VIDEO_DIR, exist_ok=True)
-        filename = f"autoz_{username}_{int(time.time())}.mp4"
-        path = os.path.join(VIDEO_DIR, filename)
 
-        # ✅ Force correct path format
-        path = path.replace("//", "/")
+        # ✅ Correct call — give only folder name, not file path
+        video_path = cl.video_download(ch.pk, folder=VIDEO_DIR)
 
-        cl.video_download(ch.pk, path)
-        return True, path
+        return True, video_path
     except Exception as e:
         traceback.print_exc()
         return False, str(e)
@@ -323,6 +323,7 @@ def main():
             traceback.print_exc(); time.sleep(2)
 
 if __name__=="__main__": main()
+
 
 
 
