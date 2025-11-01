@@ -242,7 +242,7 @@ def setinterval(u,c):
         u.message.reply_text("Usage: /setinterval <min_seconds> <max_seconds>"); return
     try:
         mn=int(a[0]); mx=int(a[1])
-        if mn<600 or mx<mn: u.message.reply_text("Keep min>=600 and max>=min"); return
+        if mn<10 or mx<mn: u.message.reply_text("Keep min>=10 and max>=min"); return
         data["autoz"]["interval_min"]=mn; data["autoz"]["interval_max"]=mx; save_data(data)
         u.message.reply_text(f"Interval set: {mn}-{mx}s ✅")
     except: u.message.reply_text("Invalid numbers")
@@ -314,3 +314,4 @@ def main():
             traceback.print_exc(); time.sleep(2)
 
 if __name__=="__main__": main()
+
